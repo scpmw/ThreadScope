@@ -31,6 +31,7 @@ import GUI.Timeline
 import GUI.TraceView
 import GUI.BookmarkView
 import GUI.KeyView
+import GUI.SourceView
 import GUI.SaveAs
 import qualified GUI.ConcurrencyControl as ConcurrencyControl
 import qualified GUI.ProgressView as ProgressView
@@ -45,6 +46,7 @@ data UIEnv = UIEnv {
        traceView     :: TraceView,
        bookmarkView  :: BookmarkView,
        keyView       :: KeyView,
+       sourceView    :: SourceView,
 
        eventQueue    :: Chan Event,
        concCtl       :: ConcurrencyControl.ConcurrencyControl
@@ -142,6 +144,9 @@ constructUI = failOnGError $ do
 
   traceView <- traceViewNew builder TraceViewActions {
     traceViewTracesChanged = post . EventTracesChanged
+  }
+
+  sourceView <- sourceViewNew builder SourceViewActions {
   }
 
   bookmarkView <- bookmarkViewNew builder BookmarkViewActions {
@@ -275,6 +280,7 @@ eventLoop uienv@UIEnv{..} eventlogState = do
       let cursorTs' = eventIndexToTimestamp hecs cursorPos'
       timelineSetCursor   timelineWin cursorTs'
       eventsViewSetCursor eventsView  cursorPos'
+      sourceViewSetCursor sourceView  cursorPos'
       continueWith eventlogState {
         cursorTs  = cursorTs',
         cursorPos = cursorPos'
@@ -284,6 +290,7 @@ eventLoop uienv@UIEnv{..} eventlogState = do
       let cursorPos' = timestampToEventIndex hecs cursorTs'
       timelineSetCursor   timelineWin cursorTs'
       eventsViewSetCursor eventsView  cursorPos'
+      sourceViewSetCursor sourceView  cursorPos'
       continueWith eventlogState {
         cursorTs  = cursorTs',
         cursorPos = cursorPos'
@@ -312,6 +319,7 @@ eventLoop uienv@UIEnv{..} eventlogState = do
             printf "%s (%d events, %.3fs)" name nevents timespan
 
           eventsViewSetEvents eventsView (Just (hecEventArray hecs))
+          sourceViewSetEvents sourceView mfilename (Just $ hecEventArray hecs)
           traceViewSetHECs traceView hecs
           traces' <- traceViewGetTraces traceView
           timelineWindowSetHECs timelineWin (Just hecs)

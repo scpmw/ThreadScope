@@ -21,7 +21,9 @@ Executable threadscope
                      gtk >= 0.11, cairo, glib, pango,
                      binary, array, mtl, filepath,
                      ghc-events >= 0.2,
-                     containers >= 0.2 && < 0.5
+                     containers >= 0.2 && < 0.5,
+                     parse-objdump >= 0.1,
+                     hpc, directory
   extensions:        RecordWildCards, NamedFieldPuns,
                      BangPatterns, PatternGuards,
                      CPP
@@ -39,6 +41,7 @@ Executable threadscope
                      GUI.TraceView,
                      GUI.BookmarkView,
                      GUI.KeyView,
+                     GUI.SourceView,
                      GUI.Types,
                      GUI.ConcurrencyControl,
                      GUI.ViewerColours,

@@ -378,12 +378,8 @@ findLocalTicks startIx eventsArr =
       -- Weight them by distance to start point
       weighted      = map (uncurry $ weightTicks winMid) samples
       
-      -- Group together same tick IDs
-      sorted        = sortBy (compare `F.on` fst) $ concat weighted
-      grouped       = groupBy ((==) `F.on` fst) sorted
-      
       -- Sum up weighted frequencies by tick IDs
-      summed        = map (\ts -> (fst $ head ts, sum $ map snd ts)) grouped
+      summed        = nubSumBy (compare `F.on` fst) (\(t,w1) (_,w2)->(t,w1+w2)) $ concat weighted
       grandSum      = sum $ map snd summed
       normalized    = map (second (/ grandSum)) summed
       
@@ -536,7 +532,8 @@ decodeName s = (sanitize s', m_i)
     sanitize s
       | "_info" `isSuffixOf` s = zdecode $ take (length s - 5) s
       | "_static" `isSuffixOf` s = zdecode $ take (length s - 7) s
-      | "_con" `isSuffixOf` s  = zdecode $ take (length s - 4) s
+      | "_con"  `isSuffixOf` s = zdecode $ take (length s - 4) s
+      | "_slow" `isSuffixOf` s = zdecode $ take (length s - 5) s
       | otherwise              = zdecode $ s
       
 zdecode :: String -> String
@@ -566,8 +563,12 @@ zdecode []           = []
 
 clearTextTags :: TextBuffer -> IO ()
 clearTextTags sourceBuffer = do
+  tagListRef <- newIORef []
   tagTable <- textBufferGetTagTable sourceBuffer
-  textTagTableForeach tagTable (textTagTableRemove tagTable)  
+  -- textTagTableForeach tagTable (textTagTableRemove tagTable)  
+  textTagTableForeach tagTable (\t -> modifyIORef tagListRef (t:))
+  tagList <- readIORef tagListRef
+  mapM_ (textTagTableRemove tagTable) tagList
 
 showModule :: SourceView -> String -> IO ()
 showModule view@SourceView{..} modName = do
@@ -641,10 +642,16 @@ annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
                   | Tag{tagFreq, tagTick = Just tick} <- tags
                   , Just sticks <- [lookup (fromIntegral tick) cixMap]
                   , stick <- sticks]
-      --freqMap'  = groupBy ((==) `F.on` snd) $ sortBy (compare `F.on` snd) freqMap
-      --freqMap'' = map (\fs -> (sum $ map fst fs, snd $ head fs)) freqMap'
       freqMap''   = nubSumBy (compare `F.on` snd) (\(f1, _) (f2, t) -> (f1+f2,t)) freqMap
   
+  -- Safe version of textBufferGetIterAtLineOffset
+  lineCount <- textBufferGetLineCount sourceBuffer
+  let textBufferGetIterAtLineOffsetSafe l c
+        | l >= lineCount = textBufferGetEndIter sourceBuffer
+        | otherwise = do iter <- textBufferGetIterAtLine sourceBuffer l
+                         textIterForwardChars iter c
+                         return iter
+
   forM_ freqMap'' $ \(freq, stick) -> do
         
     -- Create color tag
@@ -658,9 +665,8 @@ annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
       
       -- Place at code position
     let (sl, sc, el, ec) = fromHpcPos $ fst (mixe !! stick)
-    -- print (stick, freq, sl, sc, el, ec, w)
-    start <- textBufferGetIterAtLineOffset sourceBuffer (sl-1) (sc-1)
-    end <- textBufferGetIterAtLineOffset sourceBuffer (el-1) ec
+    start <- textBufferGetIterAtLineOffsetSafe (sl-1) (sc-1)
+    end <- textBufferGetIterAtLineOffsetSafe (el-1) ec
     textBufferApplyTag sourceBuffer tag start end
   
   -- Scroll to largest tick

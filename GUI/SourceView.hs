@@ -1,4 +1,6 @@
 
+{-# LANGUAGE StandaloneDeriving #-}
+
 module GUI.SourceView (
   SourceView,
   sourceViewNew,
@@ -17,7 +19,7 @@ import GHC.RTS.Events
 import Graphics.UI.Gtk
 
 import Trace.Hpc.Mix (Mix(..), readMix)
-import Trace.Hpc.Cix (CixTree(..), CixInfo(..), CixType(..), readCix)
+import Trace.Hpc.Cix (CixTree(..), CixInfo(..), CixType(..), readCix, dumpCix)
 import Trace.Hpc.Util (insideHpcPos, fromHpcPos)
 
 import Text.Objdump  (ObjRangeType(..), ObjRange(..), readObjRanges)
@@ -29,6 +31,7 @@ import Data.List
 import Data.Word (Word32)
 import qualified Data.Function as F
 import qualified Data.IntMap as IM
+import qualified Data.Map as M
 import Data.Char (isDigit, ord)
 
 import System.FilePath
@@ -41,6 +44,8 @@ import Control.Arrow (first, second)
 import Numeric (showHex)
 
 import Text.Printf
+
+import Debug.Trace
 
 -------------------------------------------------------------------------------
 
@@ -55,7 +60,7 @@ data SourceView = SourceView {
 type EventsArray = Array Int CapEvent
 type FileMap = [(String, FilePath)]
 type UnitMap = [(FilePath, String)]
-type CixMap = [(Int, [Int])] -- TODO: Right now this is completely module-oblivious!
+type CixMap = [(Int, [[Int]])] -- TODO: Right now this is completely module-oblivious!
 type RangeMap = IM.IntMap ObjRange
 type CoreMap = [(Int, String)]
 
@@ -167,12 +172,12 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
       putStr $ "Searching sources... "
       (fileMap, unitMap) <-
         findSourceFiles searchDirs $ nub $
-          [ raUnit | ObjRange {raUnit} <- ipRanges, takeExtension raUnit == ".hs"]
+          [ raUnit | ObjRange {raUnit} <- ipRanges, 
+            takeExtension raUnit == ".hs" || takeExtension raUnit == ".lhs"]
       putStrLn $ show (length fileMap) ++ " files found: " ++ show fileMap
       
       -- Build range map      
       let rangeMap = buildRangeMap ipRanges
-      --mapM_ print $ IM.toAscList rangeMap
       
       -- Find mappings for all source files
       putStr $ "Loading Mix/Cix... "
@@ -180,18 +185,30 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
       putStrLn $ "got " ++ show (length mixData) ++ " Mix and " 
         ++ show (length cixData) ++ " Cix"
       
-      let (cixMaps, coreMaps) = unzip $ map (uncurry f) cixData
+      let (cixMaps, coreMaps) = unzip $ map (uncurry f) $ cixData
           f m cix = let mix = fromJust (lookup m mixData)
-                        (cxm, cdm) = mkCixMap cix mix
+                        (cxm, cdm) = mkCixMap (simplifyCix cix) mix
                     in ((m, cxm), (m, cdm))
       putStrLn $ "I have " ++ show (length $ nub $ concatMap snd $ concatMap snd cixMaps) 
         ++ " source code locations and " ++ show (length $ concatMap snd cixMaps) 
         ++ " instrumentation points for annotation"
+        
+        
+      putStrLn "Here's what Cix I have:"
+      forM_ (zip cixData cixMaps) $ \((mod, cix), (_, cm)) -> do
+        putStrLn $ "== For module " ++ mod ++ ":"
+        putStrLn $ dumpCix cix
+        putStrLn $ "== Enormously simplificated:"
+        putStrLn $ dumpCix $ simplifyCix cix
+        putStrLn "== Derived map:"
+        forM_ cm $ \(itk, stks) -> do
+          putStr $ show itk ++ " -> "
+          print stks
       
       let tags = tagsFromLocalTicks 0 eventsArr ++ tagsFromLocalIPs 0 eventsArr rangeMap unitMap
           selection = Nothing
           currentMod = Nothing
-      
+          
       return StateLoaded {..}
     
     _other -> return StateEmpty
@@ -326,7 +343,11 @@ updateTagSelection view@SourceView{..} = do
         selection = select'
         }
       -- Update view
-      showModule view "Main"
+      let mod | Just (Tag { tagModule = Just mod}) <- select' 
+              = mod
+              | otherwise
+              = "Main"
+      showModule view mod
       updateTextTags view
     _ -> return ()
   
@@ -453,8 +474,10 @@ buildRangeMap ranges =
       
 findLocalIPsamples :: Int -> EventsArray -> [(Timestamp, [Word32])]
 findLocalIPsamples startIx eventsArr =
-  let getIPs CapEvent{{-ce_cap,-}ce_event=Event{time,spec=InstrPtrSample{..}}} 
+  let getIPs CapEvent{{-ce_cap,-}ce_event=Event{time,spec=InstrPtrSample{..}}}
         = Just ({- ce_cap, -}time, ips)
+--      getIPs CapEvent{{-ce_cap,-}ce_event=Event{time,spec=Blackhole{..}}} 
+--        = Just (time, [ip])
       getIPs _other
         = Nothing
   in findLocalEvents startIx ipSampleWinSize eventsArr getIPs
@@ -569,7 +592,7 @@ clearTextTags sourceBuffer = do
   textTagTableForeach tagTable (\t -> modifyIORef tagListRef (t:))
   tagList <- readIORef tagListRef
   mapM_ (textTagTableRemove tagTable) tagList
-
+  
 showModule :: SourceView -> String -> IO ()
 showModule view@SourceView{..} modName = do
   state <- readIORef stateRef
@@ -617,10 +640,11 @@ updateTextTags SourceView{..} = do
         setMonospaceFont sourceBuffer
         
         -- Annotate source code
-        annotateTags sourceView sourceBuffer cixMap mix tags False
+        let filterLocal = filter ((== currentMod) . tagModule)
+        annotateTags sourceView sourceBuffer cixMap mix (filterLocal tags) False
         case selection of
          Nothing  -> return ()
-         Just sel -> annotateTags sourceView sourceBuffer cixMap mix [sel] True
+         Just sel -> annotateTags sourceView sourceBuffer cixMap mix (filterLocal [sel]) True
 
     _ -> return ()
   
@@ -638,28 +662,31 @@ annotateTags :: TextView -> TextBuffer -> CixMap -> Mix -> [Tag] -> Bool -> IO (
 annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
   tagTable <- textBufferGetTagTable sourceBuffer  
   
-  let freqMap   = [(tagFreq, stick)
+  let freqMap   = [(tagFreq, (lvl, stick))
                   | Tag{tagFreq, tagTick = Just tick} <- tags
-                  , Just sticks <- [lookup (fromIntegral tick) cixMap]
+                  , Just fragments <- [lookup (fromIntegral tick) cixMap]
+                  , (lvl, sticks) <- zip [-1,-2..] fragments
                   , stick <- sticks]
-      freqMap''   = nubSumBy (compare `F.on` snd) (\(f1, _) (f2, t) -> (f1+f2,t)) freqMap
+      freqMap'  = nubSumBy (compare `F.on` snd) (\(f1, _) (f2, t) -> (f1+f2,t)) freqMap
   
-  -- Safe version of textBufferGetIterAtLineOffset
+  -- "Safe" version of textBufferGetIterAtLineOffset
   lineCount <- textBufferGetLineCount sourceBuffer
   let textBufferGetIterAtLineOffsetSafe l c
         | l >= lineCount = textBufferGetEndIter sourceBuffer
         | otherwise = do iter <- textBufferGetIterAtLine sourceBuffer l
                          textIterForwardChars iter c
                          return iter
-
-  forM_ freqMap'' $ \(freq, stick) -> do
+        
+  forM_ freqMap' $ \(freq, (lvl, stick)) -> when (sel || lvl == 1) $ do
         
     -- Create color tag
     tag <- textTagNew Nothing
     let w = min 230 $ max 0 $ 255 - round (255 * freq)
-        ws | w < 16 = '0': showHex w ""
-           | True   = showHex w ""
-        clr = if sel then "#ff" ++ ws ++ ws else "#" ++ ws ++ ws ++ "ff"
+        ws w | w < 16 = '0': showHex w ""
+             | True   = showHex w ""
+        w' = 255 - round (fromIntegral 255 / fromIntegral (-lvl))
+        clr | sel  = "#ff" ++ ws w' ++ ws w' 
+            | True = "#" ++ ws w ++ ws w ++ "ff"
     set tag [textTagBackground := clr, textTagBackgroundSet := True]
     tagTable `textTagTableAdd` tag
       
@@ -668,11 +695,13 @@ annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
     start <- textBufferGetIterAtLineOffsetSafe (sl-1) (sc-1)
     end <- textBufferGetIterAtLineOffsetSafe (el-1) ec
     textBufferApplyTag sourceBuffer tag start end
+    
+    putStrLn $ "Annotating " ++ show (sl, sc, el, ec) ++ " with " ++ clr ++ "(lvl " ++ show lvl ++ ")"
   
   -- Scroll to largest tick
-  when (sel && not (null freqMap'')) $ do
-    let ticks = map (fst . (mixe !!) . snd) freqMap''
-        hpcSize p = let (sl, sc, el, ec) = fromHpcPos p in (el-sl, ec-sc)
+  let ticks = map (fst . (mixe !!) . snd . snd) freqMap'
+  when (sel && not (null ticks)) $ do
+    let hpcSize p = let (sl, sc, el, ec) = fromHpcPos p in (el-sl, ec-sc)
         largestTick = maximumBy (compare `F.on` hpcSize) ticks
         (l, c, _, _) = fromHpcPos largestTick
     iter <- textBufferGetIterAtLineOffset sourceBuffer (l-1) (c-1)
@@ -680,7 +709,44 @@ annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
     return ()
       
 -------------------------------------------------------------------------------
-  
+
+deriving instance Eq CixType
+deriving instance Ord CixType
+deriving instance Eq CixInfo
+deriving instance Ord CixInfo
+
+simplifyCix :: CixTree -> CixTree
+simplifyCix (CixTree cis cts code)
+  | null cts 
+    || M.null overlaps 
+    || length (snd bestOverlap) <= 1
+                 = CixTree cis (map simplifyCix cts) code
+  | otherwise    = simplifyCix (CixTree cis cts' code)
+  where
+    
+    sourceInfos (CixTree cis _ _) = mapMaybe getSource cis
+    getSource ci@(CixInfo CixSource _ _) = Just ci
+    getSource _                          = Nothing
+        
+    -- Map from source ticks to child nodes that contain them
+    overlaps :: M.Map CixInfo [CixTree]
+    overlaps = foldl' addOverlaps M.empty cts
+    addOverlaps m ct = foldl' f m (sourceInfos ct)
+      where f m i = M.insertWith (++) i [ct] m
+    
+    -- Source tick that appears in most nodes
+    bestOverlap = maximumBy (compare `F.on` (length . snd)) $ M.assocs overlaps
+    
+    -- Source ticks shared by all nodes containing the "best" source tick
+    sharedOverlap = foldl1 intersect $ map sourceInfos $ snd bestOverlap
+    
+    -- Move all children with overlap into a new node
+    removeOverlap (CixTree cis cts code) = CixTree (filter (not . (`elem` sharedOverlap)) cis) cts code
+    newNode = CixTree sharedOverlap (map removeOverlap $ snd bestOverlap) Nothing
+    
+    -- Remove all moved nodes
+    filtered = filter (\n -> not $ all (`elem` sourceInfos n) sharedOverlap) cts
+    cts' = traceShow sharedOverlap $ {-traceShow newNode $-} newNode : filtered
   
 -- | Takes Cix and Mix information and finds which instrumentation
 -- ticks could be associated with which source ticks.
@@ -697,22 +763,33 @@ rawCixMap cix _mix = snd $ go [] cix
     getSrcTick (CixInfo CixInstrument _ _) = error "Funny place for an instrumentation tick..."
     
     -- Go through tree. For each instrumentation tick, give context:
-    -- 1) All source ticks on the path to the root
-    -- 2) All source ticks directly below
-    -- Both stop on the first instrumentation tick that is encountered
-    go :: [Int] -> CixTree -> ([Int], (CixMap, CoreMap))
-    go ctx (CixTree ((CixInfo CixInstrument _ n):cis) cxs m_cd) =
+    -- 1) All source ticks directly below
+    -- 2) All source ticks on the path to the root
+    -- The list is segmented by instrumentation ticks encountered
+    go :: [[Int]] -> CixTree -> ([Int], (CixMap, CoreMap))
+    go ctxUp (CixTree ((CixInfo CixInstrument _ n):cis) cxs m_cd) =
+      -- On instrumentation tick, we segment the list: Add another
+      -- segment no matter what (so source ticks farther down might
+      -- get added to it!)
       let srcs = map getSrcTick cis
-          ctx' | null srcs = ctx          
-               | otherwise = srcs
-          (ctx2, (cxm, cdm)) = goSum $ map (go ctx') cxs
-          cxm' = (n, nub $ ctx ++ ctx2):cxm
+          ctxUp' = srcs:ctxUp
+          (ctxDown, (cxm, cdm)) = goSum $ map (go ctxUp') cxs
+          -- Create new entries for cix and core map. Note we filter
+          -- empty segments as well as duplicated source code ticks.
+          cxm' = (n, filter (not . null) $ map nub $ (srcs++ctxDown):ctxUp):cxm
           cdm' | Just cd <- m_cd = (n, cd):cdm
                | otherwise       = cdm
       in ([], (cxm', cdm'))
-    go ctx (CixTree cis cxs _) = 
+    go ctxUp (CixTree cis cxs _) =
+      -- We have no instrumentation tick, therefore don't segment:
+      -- Just add source ticks to last segment seen
       let srcs = map getSrcTick cis
-          (ctx2, (cxm, cdm)) = goSum $ map (go (ctx ++ srcs)) cxs
+          {-ctxUp' = case ctxUp of 
+            (ctxHd:ctxTl)  -> (ctxHd ++ srcs):ctxTl
+            [] | null srcs -> []
+               | otherwise -> [srcs]-}
+          ctxUp' = srcs:ctxUp
+          (ctx2, (cxm, cdm)) = goSum $ map (go ctxUp') cxs
       in (ctx2 ++ srcs, (cxm, cdm))
 
 -- | Given a list of source tick IDs, eliminates all ranges that are a
@@ -726,7 +803,7 @@ elimSubranges (Mix _ _ _ _ mixe) = go []
 
 -- | Like @rawCixMap@, but removes subranges in source ticks
 mkCixMap :: CixTree -> Mix -> (CixMap, CoreMap)
-mkCixMap cix mix = first (map (second (elimSubranges mix))) $ rawCixMap cix mix
+mkCixMap cix mix = first (map $ second $ map $ elimSubranges mix) $ rawCixMap cix mix
     
 -------------------------------------------------------------------------------
 
@@ -737,7 +814,8 @@ showCore SourceView{..} = do
     StateLoaded{..} 
       | Just tag <- selection
       , Just n <- tagTick tag
-      , Just core <- lookup (fromIntegral n) =<< lookup "Main" coreMaps -> do
+      , Just mod <- tagModule tag
+      , Just core <- lookup (fromIntegral n) =<< lookup mod coreMaps -> do
         
         clearTextTags sourceBuffer
         textBufferSetText sourceBuffer core

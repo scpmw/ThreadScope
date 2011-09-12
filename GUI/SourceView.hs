@@ -56,6 +56,16 @@ data SourceView = SourceView {
   tagsStore    :: !(ListStore Tag),
   tagsTreeView :: !TreeView
   }
+                  
+data DebugEntry = DebugEntry {
+  dbgModule :: String,
+  dbgLabel :: String,
+  dbgName :: Maybe String,
+  dbgInstr :: Maybe Int,
+  dbgParent :: Maybe DebugEntry,
+  dbgSources :: [(Int, Int, Int, Int)],
+  dbgCore :: Maybe String
+  } deriving Show
 
 type EventsArray = Array Int CapEvent
 type FileMap = [(String, FilePath)]
@@ -63,6 +73,7 @@ type UnitMap = [(FilePath, String)]
 type CixMap = [(Int, [[Int]])] -- TODO: Right now this is completely module-oblivious!
 type RangeMap = IM.IntMap ObjRange
 type CoreMap = [(Int, String)]
+type DbgMap = [DebugEntry]
 
 data Tag = Tag {
   -- | Module this tag belongs to. If @Nothing@, the tag could not be
@@ -90,6 +101,7 @@ data SourceViewState
     mixData    :: [(String, Mix)],          -- ^ Mix for all loaded modules
     cixData    :: [(String, CixTree)],      -- ^ Cix for all loaded modules
     cixMaps    :: [(String, CixMap)],
+    dbgMaps    :: [(String, DbgMap)],
     coreMaps   :: [(String, CoreMap)],
     rangeMap   :: RangeMap,
     tags       :: [Tag],
@@ -179,6 +191,10 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
       -- Build range map      
       let rangeMap = buildRangeMap ipRanges
       
+      let dbgMaps = [("", buildDbgMap eventsArr)]
+          
+      mapM_ (mapM_ print . snd) dbgMaps
+
       -- Find mappings for all source files
       putStr $ "Loading Mix/Cix... "
       (mixData, cixData) <- loadMixes searchDirs fileMap
@@ -192,7 +208,6 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
       putStrLn $ "I have " ++ show (length $ nub $ concatMap snd $ concatMap snd cixMaps) 
         ++ " source code locations and " ++ show (length $ concatMap snd cixMaps) 
         ++ " instrumentation points for annotation"
-        
         
       putStrLn "Here's what Cix I have:"
       forM_ (zip cixData cixMaps) $ \((mod, cix), (_, cm)) -> do
@@ -235,7 +250,7 @@ findSourceFiles searchDirs sources = unzip . catMaybes <$> mapM findSource sourc
      -- Look for the source file
      m_file <- searchFile searchDirs source
      case m_file of
-       Nothing -> return Nothing -- There simply must be a way to get around this.
+       Nothing -> return Nothing -- There simply must be a way to get around this. MaybeT?
        Just file -> do
          m_name <- getModuleName file
          case m_name of
@@ -521,7 +536,7 @@ tagsFromLocalIPs startIx eventsArr rangeMap unitMap =
            _ | null raUnit -> Nothing   
              | otherwise   -> Just $ takeFileName raUnit,
         tagName = Just name,
-        tagTick = fromIntegral <$> tk,
+        tagTick = fromIntegral <$> tk, -- TODO: Nothing!
         tagFreq = freq
         } where (name, tk) = decodeName raName
                 
@@ -833,3 +848,49 @@ clampBounds (lower, upper) x
   | x <= lower = lower
   | x >  upper = upper
   | otherwise  = x
+
+-------------------------------------------------------------------------------
+
+lookupDbgInstr :: Int -> DbgMap -> Maybe DebugEntry
+lookupDbgInstr instr = find ((== Just instr) . dbgInstr)
+
+buildDbgMap :: EventsArray -> DbgMap
+buildDbgMap arr = dbgMap
+  where
+    dbgMap = go "" "" 0 (elems arr) []
+    go _     _     _    []     xs = xs
+    go mname mfile moff (e:es) xs = case spec $ ce_event e of
+      CreateThread {} 
+        -> xs -- Don't expect any further debug data
+      HpcModule { modName, modBase }
+        -> go modName (modName ++ ".hs") modBase es xs
+      DebugModule { file }
+        -> go mname file moff es xs
+      DebugProcedure { instr, parent, label }
+        -> let (name, srcs, core) = go_proc Nothing [] Nothing es
+               p_entry = parent >>= \i -> lookupDbgInstr (fI i) dbgMap  
+               entry = DebugEntry { dbgModule = mname
+                                  , dbgLabel = label
+                                  , dbgName = name
+                                  , dbgInstr = fmap (fI.(+moff).fI) instr
+                                  , dbgParent = p_entry
+                                  , dbgSources = srcs
+                                  , dbgCore = core
+                                  }
+           in go mname mfile moff es (entry:xs)
+      other -> go mname mfile moff es xs
+    go_proc name srcs core [] = (name, reverse srcs, core)
+    go_proc name srcs core (e:es) = case spec $ ce_event e of
+      DebugSource { sline, scol, eline, ecol }
+        -> go_proc name ((fI sline, fI scol, fI eline, fI ecol):srcs) core es
+      DebugCore { dbgCore } | core == Nothing
+        -> go_proc name srcs (Just dbgCore) es
+      DebugName { dbgName } | name == Nothing
+        -> go_proc (Just dbgName) srcs core es
+      DebugProcedure {} -> stop
+      CreateThread {} -> stop
+      other
+        -> go_proc name srcs core es
+      where stop = (name, reverse srcs, core)
+    fI :: (Integral a, Integral b) => a -> b 
+    fI = fromIntegral

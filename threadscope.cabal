@@ -7,18 +7,18 @@ Copyright:           Released under the GHC license
 Author:              Donnie Jones, Simon Marlow, Satnam Singh, Duncan Coutts
 Maintainer:          Satnam Singh <s.singh@ieee.org>
 Bug-reports:	     Satnam Singh <s.singh@ieee.org>
-Stability:	     Preliminary release.
+Stability:           Preliminary release.
 Build-Type:          Simple
 Cabal-Version:       >=1.2
-Data-files:	     threadscope.ui, threadscope.png
-cabal-version: 	     >= 1.6
+Data-files:          threadscope.ui, threadscope.png, haskell.lang
+cabal-version:       >= 1.6
 Category:            Thread profiling utility
 Synopsis:            A graphical thread profiler.
 
 Executable threadscope
   Main-is:           Main.hs
   Build-Depends:     base >= 4.0 && < 5, 
-                     gtk >= 0.11, cairo, glib, pango,
+                     gtk >= 0.11, cairo, glib, pango, gtksourceview2,
                      binary, array, mtl, filepath,
                      ghc-events >= 0.2,
                      containers >= 0.2 && < 0.5,

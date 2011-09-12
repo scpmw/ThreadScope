@@ -17,54 +17,59 @@ module GUI.SourceView (
 import GHC.RTS.Events
 
 import Graphics.UI.Gtk
+import Graphics.UI.Gtk.SourceView hiding (SourceView, sourceViewNew)
+import qualified Graphics.UI.Gtk.SourceView as GtkSourceView
 
 import Trace.Hpc.Mix (Mix(..), readMix)
-import Trace.Hpc.Cix (CixTree(..), CixInfo(..), CixType(..), readCix, dumpCix)
+import Trace.Hpc.Cix (CixTree(..), CixInfo(..), CixType(..), readCix, emptyCix)
 import Trace.Hpc.Util (insideHpcPos, fromHpcPos)
 
 import Text.Objdump  (ObjRangeType(..), ObjRange(..), readObjRanges)
 
 import Data.Array
 import Data.IORef
-import Data.Maybe (mapMaybe, catMaybes, fromJust)
+import Data.Maybe (mapMaybe, catMaybes, fromJust, fromMaybe)
 import Data.List
 import Data.Word (Word32)
 import qualified Data.Function as F
 import qualified Data.IntMap as IM
 import qualified Data.Map as M
 import Data.Char (isDigit, ord)
+import Data.Monoid (mappend)
 
 import System.FilePath
 import System.Directory (doesFileExist,getCurrentDirectory,canonicalizePath)
 
-import Control.Monad (forM_, forM, when)
-import Control.Applicative ((<$>))
+import Control.Monad (forM_, forM, when, join)
+import Control.Applicative ((<$>), (<*>))
 import Control.Arrow (first, second)
+import Control.Exception as E
 
 import Numeric (showHex)
 
 import Text.Printf
 
-import Debug.Trace
+import Paths_threadscope (getDataFileName)
 
 -------------------------------------------------------------------------------
 
 data SourceView = SourceView {
   stateRef     :: !(IORef SourceViewState),
-  sourceView   :: !TextView,
-  sourceBuffer :: !TextBuffer,
+  sourceView   :: !GtkSourceView.SourceView,
+  sourceBuffer :: !SourceBuffer,
   tagsStore    :: !(ListStore Tag),
   tagsTreeView :: !TreeView
   }
-                  
+
 data DebugEntry = DebugEntry {
   dbgModule :: String,
+  dbgFile :: String,
   dbgLabel :: String,
-  dbgName :: Maybe String,
+  dbgDName :: Maybe String,
   dbgInstr :: Maybe Int,
   dbgParent :: Maybe DebugEntry,
   dbgSources :: [(Int, Int, Int, Int)],
-  dbgCore :: Maybe String
+  dbgDCore :: Maybe (String, String)
   } deriving Show
 
 type EventsArray = Array Int CapEvent
@@ -78,19 +83,21 @@ type DbgMap = [DebugEntry]
 data Tag = Tag {
   -- | Module this tag belongs to. If @Nothing@, the tag could not be
   -- assigned to a module (e.g. a global symbol)
-  tagModule :: Maybe String, 
+  tagModule :: Maybe String,
   -- | Name of the tag. If @Nothing@, the tag does not have a name, as
   -- will be the case for most Haskell expressions
   tagName :: Maybe String,
   -- | Tick number of the tag. This is only set if there's a Haskell
   -- expression the tag could be mapped to
   tagTick :: Maybe Word32,
+  -- | Debug data available for the tag
+  tagDebug :: Maybe DebugEntry,
   -- | Approximate frequency of the tag getting hit
   tagFreq :: !Double
   } deriving (Show)
 
 instance Eq Tag where
-  (Tag m1 n1 t1 _) == (Tag m2 n2 t2 _)  = m1 == m2 && (n1 == n2 || t1 == t2)
+  (Tag m1 n1 t1 _ _) == (Tag m2 n2 t2 _ _)  = m1 == m2 && (n1 == n2 || t1 == t2)
   
 data SourceViewState 
   = StateEmpty
@@ -101,7 +108,7 @@ data SourceViewState
     mixData    :: [(String, Mix)],          -- ^ Mix for all loaded modules
     cixData    :: [(String, CixTree)],      -- ^ Cix for all loaded modules
     cixMaps    :: [(String, CixMap)],
-    dbgMaps    :: [(String, DbgMap)],
+    dbgMap     :: DbgMap,
     coreMaps   :: [(String, CoreMap)],
     rangeMap   :: RangeMap,
     tags       :: [Tag],
@@ -127,8 +134,17 @@ sourceViewNew builder SourceViewActions{..} = do
   stateRef <- newIORef StateEmpty
   
   let getWidget cast = builderGetObject builder cast
-  sourceView   <- getWidget castToTextView "source"
-  sourceBuffer <- textViewGetBuffer sourceView
+  sourceView   <- getWidget castToSourceView "source"
+  langManager  <- sourceLanguageManagerGetDefault
+  searchPath   <- sourceLanguageManagerGetSearchPath langManager
+  searchDir    <- getDataFileName "haskell.lang"
+  sourceLanguageManagerSetSearchPath langManager
+    (Just (takeDirectory searchDir : searchPath))
+  haskellLang  <- sourceLanguageManagerGetLanguage langManager "haskell"
+  sourceBuffer <- case haskellLang of
+    Just haskell -> sourceBufferNewWithLanguage haskell
+    Nothing      -> sourceBufferNew Nothing 
+  textViewSetBuffer sourceView sourceBuffer
   
   tagsTreeView <- getWidget castToTreeView "source_tagstree"
   tagsStore    <- listStoreNew []
@@ -140,23 +156,31 @@ sourceViewNew builder SourceViewActions{..} = do
         treeViewColumnPackStart col render True
         treeViewAppendColumn tagsTreeView col
         return (col, render)
-        
+
   (tagFreqCol, tagFreqRender) <- mkColumn "%"
-  (tagTickCol, tagTickRender) <- mkColumn "Tk"
-  (tagNameCol, tagNameRender) <- mkColumn "Name"
-  
+  (tagDescCol, tagDescRender) <- mkColumn "Name"
+  (tagNameCol, tagNameRender) <- mkColumn "Core"
+
   treeViewSetModel tagsTreeView tagsStore
-  
+
   cellLayoutSetAttributes tagFreqCol tagFreqRender tagsStore $ \Tag{..} ->
     [ cellText := printf "%02.1f" (tagFreq * 100) ]
-  cellLayoutSetAttributes tagTickCol tagTickRender tagsStore $ \Tag{..} ->
-    [ cellText := maybe "" show tagTick ]
+  --cellLayoutSetAttributes tagTickCol tagTickRender tagsStore $ \Tag{..} ->
+  --  [ cellText := maybe "" show tagTick ]
   cellLayoutSetAttributes tagNameCol tagNameRender tagsStore $ \Tag{..} ->
-    [ cellText := intercalate " / " (maybe [] (\m->[m]) tagModule ++ 
-                                     maybe [] (\m->[m]) tagName)]
+    [ cellText := fromMaybe "" (fst <$> (tagDebug >>= dbgDCore)) ]
+  let findName (Just (DebugEntry { dbgDName = Just name})) = Just name
+      findName (Just (DebugEntry { dbgParent })) = findName dbgParent
+      findName Nothing = Nothing
+  cellLayoutSetAttributes tagDescCol tagDescRender tagsStore $ \Tag{..} ->
+    [ cellText := case (tagDebug, tagName) of
+         (Nothing, Just name) 
+           -> name
+         _ -> intercalate " / " (maybe [] (\m->[m]) tagModule ++ 
+                                 maybe [] (\m->[m]) (findName tagDebug))]
   
   let srcView    = SourceView {..}
-      
+  
   on tagsTreeView cursorChanged $
     updateTagSelection srcView
     
@@ -191,10 +215,8 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
       -- Build range map      
       let rangeMap = buildRangeMap ipRanges
       
-      let dbgMaps = [("", buildDbgMap eventsArr)]
+      let dbgMap = buildDbgMap eventsArr
           
-      mapM_ (mapM_ print . snd) dbgMaps
-
       -- Find mappings for all source files
       putStr $ "Loading Mix/Cix... "
       (mixData, cixData) <- loadMixes searchDirs fileMap
@@ -209,6 +231,7 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
         ++ " source code locations and " ++ show (length $ concatMap snd cixMaps) 
         ++ " instrumentation points for annotation"
         
+        {-
       putStrLn "Here's what Cix I have:"
       forM_ (zip cixData cixMaps) $ \((mod, cix), (_, cm)) -> do
         putStrLn $ "== For module " ++ mod ++ ":"
@@ -219,8 +242,11 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
         forM_ cm $ \(itk, stks) -> do
           putStr $ show itk ++ " -> "
           print stks
+-}
       
-      let tags = tagsFromLocalTicks 0 eventsArr ++ tagsFromLocalIPs 0 eventsArr rangeMap unitMap
+      let tags = tagsFromLocalTicks 0 eventsArr dbgMap ++
+--                 tagsFromLocalIPs 0 eventsArr rangeMap unitMap dbgMap ++
+                 tagsFromLocalIPs2 0 eventsArr rangeMap dbgMap
           selection = Nothing
           currentMod = Nothing
           
@@ -295,8 +321,19 @@ loadMixes searchDirs fileMap = do
       hpcDirs = map (</> ".hpc") searchDirs
         
   -- Load Mix & Cix information
-  mixes <- forM mods (\mod -> (,) mod <$> readMix hpcDirs (Left mod))
-  cixes <- forM mods (\mod -> (,) mod <$> readCix hpcDirs (Left mod))
+  (mixes, cixes) <- unzip <$> forM mods (\mod ->
+    E.catch
+    (do mix <- readMix hpcDirs (Left mod)
+        cix <- readCix hpcDirs (Left mod)
+        evaluate mix
+        evaluate cix
+        return ((mod, mix), (mod, cix))
+    )
+    (\ErrorCall {} -> do
+        let mix = Mix "" 0 0 0 []
+        let cix = emptyCix
+        return ((mod, mix), (mod, cix))
+    ))
   return (mixes, cixes)
 
 ------------------------------------------------------------------------------
@@ -309,7 +346,9 @@ sourceViewSetCursor view@SourceView {..} n = do
       
       -- Load tags for new position
       let n' = clampBounds (bounds eventsArr) n
-          tags' = tagsFromLocalTicks n' eventsArr ++ tagsFromLocalIPs n' eventsArr rangeMap unitMap
+          tags' = tagsFromLocalTicks n' eventsArr dbgMap ++
+--                  tagsFromLocalIPs n' eventsArr rangeMap unitMap dbgMap ++
+                  tagsFromLocalIPs2 n' eventsArr rangeMap dbgMap
           
       -- Update selection, if possible
       let selection' = selection >>= (\t -> find (== t) tags')
@@ -424,12 +463,13 @@ findLocalTicks startIx eventsArr =
       
   in map splitTs normalized
 
-tagsFromLocalTicks :: Int -> EventsArray -> [Tag]
-tagsFromLocalTicks startIx eventsArr = map toTag $ findLocalTicks startIx eventsArr
+tagsFromLocalTicks :: Int -> EventsArray -> DbgMap -> [Tag]
+tagsFromLocalTicks startIx eventsArr dbgMap = map toTag $ findLocalTicks startIx eventsArr
   where toTag (mod, tick, freq) = Tag {
           tagModule = Just mod,
           tagName   = Nothing,
           tagTick   = Just tick,
+          tagDebug  = lookupDbgInstr (fromIntegral tick) dbgMap,
           tagFreq   = freq
           }
 
@@ -528,15 +568,16 @@ findLocalIPsWeighted startIx eventsArr rangeMap =
       (w1, _) `plus` (w2, r) = (w1+w2, r)
   in nubSumBy ord plus wips
 
-tagsFromLocalIPs :: Int -> EventsArray -> RangeMap -> UnitMap -> [Tag]
-tagsFromLocalIPs startIx eventsArr rangeMap unitMap =
+tagsFromLocalIPs :: Int -> EventsArray -> RangeMap -> UnitMap -> DbgMap -> [Tag]
+tagsFromLocalIPs startIx eventsArr rangeMap unitMap dbgMap =
   let toTag freq ObjRange{..} = Tag {
         tagModule = case lookup raUnit unitMap of
            Just unit       -> Just unit
            _ | null raUnit -> Nothing   
              | otherwise   -> Just $ takeFileName raUnit,
         tagName = Just name,
-        tagTick = fromIntegral <$> tk, -- TODO: Nothing!
+        tagTick = fmap fromIntegral tk,
+        tagDebug = tk >>= \i -> lookupDbgInstr i dbgMap,
         tagFreq = freq
         } where (name, tk) = decodeName raName
                 
@@ -550,6 +591,43 @@ tagsFromLocalIPs startIx eventsArr rangeMap unitMap =
       ord = compare `F.on` msr
       t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }
   in nubSumBy ord plus tags
+
+tagsFromLocalIPs2 :: Int -> EventsArray -> RangeMap -> DbgMap -> [Tag]
+tagsFromLocalIPs2 startIx eventsArr rangeMap unitMap =
+  let toTag freq ObjRange{..}
+        = let m_dbg = lookupDbgLabel (takeFileName raUnit) (zdecode raName) unitMap
+              m_dbg_r = redirect m_dbg
+              redirect (Just DebugEntry{ dbgDCore = Nothing, dbgParent }) = redirect dbgParent
+              redirect other = other
+              is_haskell_like
+                = any (`isSuffixOf` raName) ["_info","_static","_con","_slow"]
+          in case m_dbg_r of
+            Just (DebugEntry {..}) -> Tag {
+              tagModule = Just dbgModule,
+              tagName = Just $ zdecode dbgLabel,
+              tagTick = Nothing,
+              tagDebug = m_dbg_r,
+              tagFreq = freq
+              }
+            Nothing -> Tag {
+              tagModule = Nothing,
+              tagName = Just $ if is_haskell_like then "(Haskell)" else "(Misc)",
+              tagTick = Nothing,
+              tagDebug = Nothing,
+              tagFreq = freq
+              }
+
+      weighted = findLocalIPsWeighted startIx eventsArr rangeMap
+      grandSum = sum $ map fst weighted
+      tags = map (uncurry toTag . first (/grandSum)) weighted
+
+      msr Tag{..}
+        | Just ti <- tagTick  = Left ti
+        | otherwise           = Right (tagModule, tagName)
+      ord = compare `F.on` msr
+      t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }
+  in nubSumBy ord plus tags
+
 
 -- | Names in the symbol table have some extra information in them, as
 -- well as often standing for actual Haskell names. We try to process
@@ -573,7 +651,7 @@ decodeName s = (sanitize s', m_i)
       | "_con"  `isSuffixOf` s = zdecode $ take (length s - 4) s
       | "_slow" `isSuffixOf` s = zdecode $ take (length s - 5) s
       | otherwise              = zdecode $ s
-      
+
 zdecode :: String -> String
 zdecode ('z':'a':cs) = '&':zdecode cs
 zdecode ('z':'b':cs) = '|':zdecode cs
@@ -599,14 +677,15 @@ zdecode []           = []
 
 -------------------------------------------------------------------------------
 
-clearTextTags :: TextBuffer -> IO ()
+clearTextTags :: SourceBuffer -> IO ()
 clearTextTags sourceBuffer = do
-  tagListRef <- newIORef []
+{-  tagListRef <- newIORef []
   tagTable <- textBufferGetTagTable sourceBuffer
   -- textTagTableForeach tagTable (textTagTableRemove tagTable)  
   textTagTableForeach tagTable (\t -> modifyIORef tagListRef (t:))
   tagList <- readIORef tagListRef
-  mapM_ (textTagTableRemove tagTable) tagList
+  mapM_ (textTagTableRemove tagTable) tagList-}
+  return ()
   
 showModule :: SourceView -> String -> IO ()
 showModule view@SourceView{..} modName = do
@@ -640,10 +719,10 @@ showModule view@SourceView{..} modName = do
 
 updateTextTags :: SourceView -> IO ()
 updateTextTags SourceView{..} = do
-  
-  state <- readIORef stateRef  
+
+  state <- readIORef stateRef
   case state of
-    StateLoaded{..} 
+    StateLoaded{..}
       | Just modName <- currentMod
       , Just cixMap <- lookup modName cixMaps
       , Just mix <- lookup modName mixData -> do
@@ -652,8 +731,8 @@ updateTextTags SourceView{..} = do
         clearTextTags sourceBuffer
 
         -- Use monospace
-        setMonospaceFont sourceBuffer
-        
+        --setMonospaceFont sourceBuffer
+
         -- Annotate source code
         let filterLocal = filter ((== currentMod) . tagModule)
         annotateTags sourceView sourceBuffer cixMap mix (filterLocal tags) False
@@ -662,8 +741,8 @@ updateTextTags SourceView{..} = do
          Just sel -> annotateTags sourceView sourceBuffer cixMap mix (filterLocal [sel]) True
 
     _ -> return ()
-  
-setMonospaceFont :: TextBuffer -> IO ()
+
+setMonospaceFont :: SourceBuffer -> IO ()
 setMonospaceFont sourceBuffer = do
   tagTable <- textBufferGetTagTable sourceBuffer  
   monoTag <- textTagNew (Just "Monospace")
@@ -673,16 +752,24 @@ setMonospaceFont sourceBuffer = do
   end <- textBufferGetEndIter sourceBuffer
   textBufferApplyTag sourceBuffer monoTag start end
 
-annotateTags :: TextView -> TextBuffer -> CixMap -> Mix -> [Tag] -> Bool -> IO ()
+annotateTags :: GtkSourceView.SourceView -> SourceBuffer -> CixMap -> Mix -> [Tag] -> Bool -> IO ()
 annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
-  tagTable <- textBufferGetTagTable sourceBuffer  
-  
-  let freqMap   = [(tagFreq, (lvl, stick))
+  tagTable <- textBufferGetTagTable sourceBuffer
+
+  let freqMap   = [(tagFreq, (lvl, fromHpcPos $ fst $ mixe !! stick))
                   | Tag{tagFreq, tagTick = Just tick} <- tags
                   , Just fragments <- [lookup (fromIntegral tick) cixMap]
                   , (lvl, sticks) <- zip [-1,-2..] fragments
                   , stick <- sticks]
-      freqMap'  = nubSumBy (compare `F.on` snd) (\(f1, _) (f2, t) -> (f1+f2,t)) freqMap
+      freqMap2 = [(tagFreq, (1, srcs))
+                 | Tag {tagFreq, tagDebug = Just dbg} <- tags
+                 , srcs <- extSources dbg ]
+      extSources DebugEntry { dbgSources, dbgDName = Nothing, dbgParent = Just p}
+        = dbgSources ++ extSources p
+      extSources DebugEntry { dbgSources}
+        = dbgSources
+      freqMap'  = nubSumBy (compare `F.on` snd) (\(f1, _) (f2, t) -> (f1+f2,t)) 
+                  (freqMap ++ freqMap2)
   
   -- "Safe" version of textBufferGetIterAtLineOffset
   lineCount <- textBufferGetLineCount sourceBuffer
@@ -692,7 +779,7 @@ annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
                          textIterForwardChars iter c
                          return iter
         
-  forM_ freqMap' $ \(freq, (lvl, stick)) -> when (sel || lvl == 1) $ do
+  forM_ freqMap' $ \(freq, (lvl, (sl, sc, el, ec))) -> when (sel || lvl == 1) $ do
         
     -- Create color tag
     tag <- textTagNew Nothing
@@ -700,25 +787,24 @@ annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
         ws w | w < 16 = '0': showHex w ""
              | True   = showHex w ""
         w' = 255 - round (fromIntegral 255 / fromIntegral (-lvl))
-        clr | sel  = "#ff" ++ ws w' ++ ws w' 
+        clr | sel  = "#ff0000"
             | True = "#" ++ ws w ++ ws w ++ "ff"
     set tag [textTagBackground := clr, textTagBackgroundSet := True]
     tagTable `textTagTableAdd` tag
       
       -- Place at code position
-    let (sl, sc, el, ec) = fromHpcPos $ fst (mixe !! stick)
     start <- textBufferGetIterAtLineOffsetSafe (sl-1) (sc-1)
     end <- textBufferGetIterAtLineOffsetSafe (el-1) ec
     textBufferApplyTag sourceBuffer tag start end
     
-    putStrLn $ "Annotating " ++ show (sl, sc, el, ec) ++ " with " ++ clr ++ "(lvl " ++ show lvl ++ ")"
+    --putStrLn $ "Annotating " ++ show (sl, sc, el, ec) ++ " with " ++ clr ++ "(lvl " ++ show lvl ++ ")"
   
   -- Scroll to largest tick
-  let ticks = map (fst . (mixe !!) . snd . snd) freqMap'
+  let ticks = map (snd . snd) freqMap'
   when (sel && not (null ticks)) $ do
-    let hpcSize p = let (sl, sc, el, ec) = fromHpcPos p in (el-sl, ec-sc)
+    let hpcSize (sl, sc, el, ec) = (el-sl, ec-sc)
         largestTick = maximumBy (compare `F.on` hpcSize) ticks
-        (l, c, _, _) = fromHpcPos largestTick
+        (l, c, _, _) = largestTick
     iter <- textBufferGetIterAtLineOffset sourceBuffer (l-1) (c-1)
     _ <- textViewScrollToIter sourceView iter 0.2 Nothing
     return ()
@@ -761,7 +847,7 @@ simplifyCix (CixTree cis cts code)
     
     -- Remove all moved nodes
     filtered = filter (\n -> not $ all (`elem` sourceInfos n) sharedOverlap) cts
-    cts' = traceShow sharedOverlap $ {-traceShow newNode $-} newNode : filtered
+    cts' = newNode : filtered
   
 -- | Takes Cix and Mix information and finds which instrumentation
 -- ticks could be associated with which source ticks.
@@ -825,16 +911,19 @@ mkCixMap cix mix = first (map $ second $ map $ elimSubranges mix) $ rawCixMap ci
 showCore :: SourceView -> IO ()
 showCore SourceView{..} = do
   state <- readIORef stateRef  
+  
+  putStrLn "Bla!"
   case state of
     StateLoaded{..} 
       | Just tag <- selection
-      , Just n <- tagTick tag
       , Just mod <- tagModule tag
-      , Just core <- lookup (fromIntegral n) =<< lookup mod coreMaps -> do
-        
+      , Just core <- (join $ lookup <$> (fromIntegral <$> tagTick tag)
+                                    <*> lookup mod coreMaps) `mappend`
+                     (tagDebug tag >>= dbgDCore >>= return . snd) -> do
+
         clearTextTags sourceBuffer
         textBufferSetText sourceBuffer core
-        setMonospaceFont sourceBuffer
+        --setMonospaceFont sourceBuffer
 
         writeIORef stateRef state { currentMod = Nothing }
 
@@ -854,13 +943,16 @@ clampBounds (lower, upper) x
 lookupDbgInstr :: Int -> DbgMap -> Maybe DebugEntry
 lookupDbgInstr instr = find ((== Just instr) . dbgInstr)
 
+lookupDbgLabel :: String -> String -> DbgMap -> Maybe DebugEntry
+lookupDbgLabel file lbl = find (\de -> dbgLabel de == lbl && dbgFile de == file)
+
 buildDbgMap :: EventsArray -> DbgMap
 buildDbgMap arr = dbgMap
   where
     dbgMap = go "" "" 0 (elems arr) []
     go _     _     _    []     xs = xs
     go mname mfile moff (e:es) xs = case spec $ ce_event e of
-      CreateThread {} 
+      CreateThread {}
         -> xs -- Don't expect any further debug data
       HpcModule { modName, modBase }
         -> go modName (modName ++ ".hs") modBase es xs
@@ -868,29 +960,33 @@ buildDbgMap arr = dbgMap
         -> go mname file moff es xs
       DebugProcedure { instr, parent, label }
         -> let (name, srcs, core) = go_proc Nothing [] Nothing es
-               p_entry = parent >>= \i -> lookupDbgInstr (fI i) dbgMap  
+               p_entry = parent >>= \i -> lookupDbgInstr (fI i) dbgMap
                entry = DebugEntry { dbgModule = mname
-                                  , dbgLabel = label
-                                  , dbgName = name
+                                  , dbgFile = mfile
+                                  , dbgLabel = hackLabel label
+                                  , dbgDName = name
                                   , dbgInstr = fmap (fI.(+moff).fI) instr
                                   , dbgParent = p_entry
                                   , dbgSources = srcs
-                                  , dbgCore = core
+                                  , dbgDCore = core
                                   }
+               -- TODO: Hack! Find out why this is needed!
+               hackLabel lbl | "sat_" `isPrefixOf` lbl = drop 4 lbl
+               hackLabel lbl = lbl
            in go mname mfile moff es (entry:xs)
-      other -> go mname mfile moff es xs
+      _other -> go mname mfile moff es xs
     go_proc name srcs core [] = (name, reverse srcs, core)
     go_proc name srcs core (e:es) = case spec $ ce_event e of
       DebugSource { sline, scol, eline, ecol }
         -> go_proc name ((fI sline, fI scol, fI eline, fI ecol):srcs) core es
-      DebugCore { dbgCore } | core == Nothing
-        -> go_proc name srcs (Just dbgCore) es
+      DebugCore { coreBind, coreCode } | core == Nothing
+        -> go_proc name srcs (Just (coreBind, coreCode)) es
       DebugName { dbgName } | name == Nothing
         -> go_proc (Just dbgName) srcs core es
       DebugProcedure {} -> stop
       CreateThread {} -> stop
-      other
+      _other
         -> go_proc name srcs core es
       where stop = (name, reverse srcs, core)
-    fI :: (Integral a, Integral b) => a -> b 
+    fI :: (Integral a, Integral b) => a -> b
     fI = fromIntegral

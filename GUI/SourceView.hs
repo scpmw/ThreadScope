@@ -34,7 +34,7 @@ import Data.Word (Word32)
 import qualified Data.Function as F
 import qualified Data.IntMap as IM
 import qualified Data.Map as M
-import Data.Char (isDigit, ord)
+import Data.Char (isDigit, ord, isSpace)
 import Data.Monoid (mappend)
 
 import System.FilePath
@@ -132,12 +132,19 @@ data SourceViewActions = SourceViewActions {
 sourceViewNew :: Builder -> SourceViewActions -> IO SourceView
 sourceViewNew builder SourceViewActions{..} = do
   stateRef <- newIORef StateEmpty
-  
+
   let getWidget cast = builderGetObject builder cast
   sourceView   <- getWidget castToSourceView "source"
   langManager  <- sourceLanguageManagerGetDefault
   searchPath   <- sourceLanguageManagerGetSearchPath langManager
   searchDir    <- getDataFileName "haskell.lang"
+
+  -- Set monospace font for source view
+  fontDesc     <- fontDescriptionNew
+  fontDescriptionSetFamily fontDesc "Monospace"
+  widgetModifyFont sourceView (Just fontDesc)
+
+  -- Create source buffer using Haskell language specs
   sourceLanguageManagerSetSearchPath langManager
     (Just (takeDirectory searchDir : searchPath))
   haskellLang  <- sourceLanguageManagerGetLanguage langManager "haskell"
@@ -145,10 +152,11 @@ sourceViewNew builder SourceViewActions{..} = do
     Just haskell -> sourceBufferNewWithLanguage haskell
     Nothing      -> sourceBufferNew Nothing 
   textViewSetBuffer sourceView sourceBuffer
-  
+
+  -- Create columns for tag list
   tagsTreeView <- getWidget castToTreeView "source_tagstree"
   tagsStore    <- listStoreNew []
-  
+
   let mkColumn title = do
         col <- treeViewColumnNew
         render <- cellRendererTextNew
@@ -161,6 +169,7 @@ sourceViewNew builder SourceViewActions{..} = do
   (tagDescCol, tagDescRender) <- mkColumn "Name"
   (tagNameCol, tagNameRender) <- mkColumn "Core"
 
+  -- Set column content
   treeViewSetModel tagsTreeView tagsStore
 
   cellLayoutSetAttributes tagFreqCol tagFreqRender tagsStore $ \Tag{..} ->
@@ -181,6 +190,7 @@ sourceViewNew builder SourceViewActions{..} = do
   
   let srcView    = SourceView {..}
   
+  -- Register events
   on tagsTreeView cursorChanged $
     updateTagSelection srcView
     
@@ -730,9 +740,6 @@ updateTextTags SourceView{..} = do
         -- Clear existing tags
         clearTextTags sourceBuffer
 
-        -- Use monospace
-        --setMonospaceFont sourceBuffer
-
         -- Annotate source code
         let filterLocal = filter ((== currentMod) . tagModule)
         annotateTags sourceView sourceBuffer cixMap mix (filterLocal tags) False
@@ -741,16 +748,6 @@ updateTextTags SourceView{..} = do
          Just sel -> annotateTags sourceView sourceBuffer cixMap mix (filterLocal [sel]) True
 
     _ -> return ()
-
-setMonospaceFont :: SourceBuffer -> IO ()
-setMonospaceFont sourceBuffer = do
-  tagTable <- textBufferGetTagTable sourceBuffer  
-  monoTag <- textTagNew (Just "Monospace")
-  set monoTag [textTagFamily := "Monospace", textTagFamilySet := True]
-  textTagTableAdd tagTable monoTag
-  start <- textBufferGetStartIter sourceBuffer
-  end <- textBufferGetEndIter sourceBuffer
-  textBufferApplyTag sourceBuffer monoTag start end
 
 annotateTags :: GtkSourceView.SourceView -> SourceBuffer -> CixMap -> Mix -> [Tag] -> Bool -> IO ()
 annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
@@ -783,12 +780,12 @@ annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
         
     -- Create color tag
     tag <- textTagNew Nothing
-    let w = min 230 $ max 0 $ 255 - round (255 * freq)
+    let w = min 230 $ max 0 $ 255 - round (100 * freq)
         ws w | w < 16 = '0': showHex w ""
              | True   = showHex w ""
-        w' = 255 - round (fromIntegral 255 / fromIntegral (-lvl))
-        clr | sel  = "#ff0000"
-            | True = "#" ++ ws w ++ ws w ++ "ff"
+        --w' = 255 - round (fromIntegral 255 / fromIntegral (-lvl))
+        clr | sel  = "#8888ff"
+            | True = "#" ++ ws w ++ ws w ++ ws w
     set tag [textTagBackground := clr, textTagBackgroundSet := True]
     tagTable `textTagTableAdd` tag
       
@@ -862,7 +859,7 @@ rawCixMap cix _mix = snd $ go [] cix
     
     getSrcTick (CixInfo CixSource _ n) = n
     getSrcTick (CixInfo CixInstrument _ _) = error "Funny place for an instrumentation tick..."
-    
+
     -- Go through tree. For each instrumentation tick, give context:
     -- 1) All source ticks directly below
     -- 2) All source ticks on the path to the root
@@ -911,8 +908,7 @@ mkCixMap cix mix = first (map $ second $ map $ elimSubranges mix) $ rawCixMap ci
 showCore :: SourceView -> IO ()
 showCore SourceView{..} = do
   state <- readIORef stateRef  
-  
-  putStrLn "Bla!"
+
   case state of
     StateLoaded{..} 
       | Just tag <- selection
@@ -922,12 +918,30 @@ showCore SourceView{..} = do
                      (tagDebug tag >>= dbgDCore >>= return . snd) -> do
 
         clearTextTags sourceBuffer
-        textBufferSetText sourceBuffer core
-        --setMonospaceFont sourceBuffer
+        textBufferSetText sourceBuffer (cleanupCore core)
 
         writeIORef stateRef state { currentMod = Nothing }
 
     _ -> return ()
+
+cleanupCore :: String -> String
+cleanupCore = unlines . go . lines
+  where
+    go (l1:l2:ls) | trivialBlank l1
+                  , trivialBlank l2
+                  , takeWhile isSpace l1 == takeWhile isSpace l2
+                  , length l1 < 80
+      = go ((l1 ++ " " ++ dropWhile isSpace l2):ls)
+    go (l:ls) = l:go ls
+    go []     = []
+
+    trivialBlank ""       = True
+    trivialBlank (' ':xs) = trivialBlank xs
+    trivialBlank ('}':xs) = trivialBlank xs
+    trivialBlank (')':xs) = trivialBlank xs
+    trivialBlank (';':xs) = trivialBlank xs
+    trivialBlank _        = False
+
 
 -------------------------------------------------------------------------------
 

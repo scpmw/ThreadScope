@@ -20,30 +20,23 @@ import Graphics.UI.Gtk
 import Graphics.UI.Gtk.SourceView hiding (SourceView, sourceViewNew)
 import qualified Graphics.UI.Gtk.SourceView as GtkSourceView
 
-import Trace.Hpc.Mix (Mix(..), readMix)
-import Trace.Hpc.Cix (CixTree(..), CixInfo(..), CixType(..), readCix, emptyCix)
-import Trace.Hpc.Util (insideHpcPos, fromHpcPos)
-
 import Text.Objdump  (ObjRangeType(..), ObjRange(..), readObjRanges)
 
 import Data.Array
 import Data.IORef
-import Data.Maybe (mapMaybe, catMaybes, fromJust, fromMaybe)
+import Data.Maybe (mapMaybe, catMaybes, fromMaybe)
 import Data.List
 import Data.Word (Word32)
 import qualified Data.Function as F
 import qualified Data.IntMap as IM
-import qualified Data.Map as M
 import Data.Char (isDigit, ord, isSpace)
-import Data.Monoid (mappend)
 
 import System.FilePath
 import System.Directory (doesFileExist,getCurrentDirectory,canonicalizePath)
 
-import Control.Monad (forM_, forM, when, join)
-import Control.Applicative ((<$>), (<*>))
+import Control.Monad (forM_, when)
+import Control.Applicative ((<$>))
 import Control.Arrow (first, second)
-import Control.Exception as E
 
 import Numeric (showHex)
 
@@ -75,9 +68,7 @@ data DebugEntry = DebugEntry {
 type EventsArray = Array Int CapEvent
 type FileMap = [(String, FilePath)]
 type UnitMap = [(FilePath, String)]
-type CixMap = [(Int, [[Int]])] -- TODO: Right now this is completely module-oblivious!
 type RangeMap = IM.IntMap ObjRange
-type CoreMap = [(Int, String)]
 type DbgMap = [DebugEntry]
 
 data Tag = Tag {
@@ -105,11 +96,7 @@ data SourceViewState
     eventsArr  :: EventsArray,
     fileMap    :: FileMap,                  -- ^ Map from all loaded modules to their actual file names
     unitMap    :: UnitMap,                  -- ^ Maps compilation unit names (from ranges) to module names
-    mixData    :: [(String, Mix)],          -- ^ Mix for all loaded modules
-    cixData    :: [(String, CixTree)],      -- ^ Cix for all loaded modules
-    cixMaps    :: [(String, CixMap)],
     dbgMap     :: DbgMap,
-    coreMaps   :: [(String, CoreMap)],
     rangeMap   :: RangeMap,
     tags       :: [Tag],
     selection  :: Maybe Tag,
@@ -227,35 +214,7 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
       
       let dbgMap = buildDbgMap eventsArr
           
-      -- Find mappings for all source files
-      putStr $ "Loading Mix/Cix... "
-      (mixData, cixData) <- loadMixes searchDirs fileMap
-      putStrLn $ "got " ++ show (length mixData) ++ " Mix and " 
-        ++ show (length cixData) ++ " Cix"
-      
-      let (cixMaps, coreMaps) = unzip $ map (uncurry f) $ cixData
-          f m cix = let mix = fromJust (lookup m mixData)
-                        (cxm, cdm) = mkCixMap (simplifyCix cix) mix
-                    in ((m, cxm), (m, cdm))
-      putStrLn $ "I have " ++ show (length $ nub $ concatMap snd $ concatMap snd cixMaps) 
-        ++ " source code locations and " ++ show (length $ concatMap snd cixMaps) 
-        ++ " instrumentation points for annotation"
-        
-        {-
-      putStrLn "Here's what Cix I have:"
-      forM_ (zip cixData cixMaps) $ \((mod, cix), (_, cm)) -> do
-        putStrLn $ "== For module " ++ mod ++ ":"
-        putStrLn $ dumpCix cix
-        putStrLn $ "== Enormously simplificated:"
-        putStrLn $ dumpCix $ simplifyCix cix
-        putStrLn "== Derived map:"
-        forM_ cm $ \(itk, stks) -> do
-          putStr $ show itk ++ " -> "
-          print stks
--}
-      
       let tags = tagsFromLocalTicks 0 eventsArr dbgMap ++
---                 tagsFromLocalIPs 0 eventsArr rangeMap unitMap dbgMap ++
                  tagsFromLocalIPs2 0 eventsArr rangeMap dbgMap
           selection = Nothing
           currentMod = Nothing
@@ -304,50 +263,6 @@ getModuleName file = do
 
 ------------------------------------------------------------------------------
 
-{-
-
--- | Extracts @HpcModule@ events from the event stream. Works only
--- sporadically right now, investigation pending.
-modulesFromEvent :: EventsArray -> [String]
-modulesFromEvent eventsArr =
-  -- Find all modules mentioned in the event log (at least the first second of it)
-  let getMod CapEvent { ce_event = Event { spec = HpcModule {modName} } }
-        = Just modName
-      getMod _
-        = Nothing
-      windowLength = 100 * 1000 * 1000 -- Look in the first 100ms
-  in mapMaybe (getMod . snd) $ 
-     takeWhile ((< windowLength) . fst) $ 
-     assocs eventsArr
-
--}
-
-------------------------------------------------------------------------------
-  
-loadMixes :: [FilePath] -> [(String, FilePath)] -> IO ([(String, Mix)], [(String, CixTree)])
-loadMixes searchDirs fileMap = do
-  
-  let mods = map fst fileMap
-      hpcDirs = map (</> ".hpc") searchDirs
-        
-  -- Load Mix & Cix information
-  (mixes, cixes) <- unzip <$> forM mods (\mod ->
-    E.catch
-    (do mix <- readMix hpcDirs (Left mod)
-        cix <- readCix hpcDirs (Left mod)
-        evaluate mix
-        evaluate cix
-        return ((mod, mix), (mod, cix))
-    )
-    (\ErrorCall {} -> do
-        let mix = Mix "" 0 0 0 []
-        let cix = emptyCix
-        return ((mod, mix), (mod, cix))
-    ))
-  return (mixes, cixes)
-
-------------------------------------------------------------------------------
-
 sourceViewSetCursor :: SourceView -> Int -> IO ()
 sourceViewSetCursor view@SourceView {..} n = do
   state <- readIORef stateRef
@@ -357,7 +272,6 @@ sourceViewSetCursor view@SourceView {..} n = do
       -- Load tags for new position
       let n' = clampBounds (bounds eventsArr) n
           tags' = tagsFromLocalTicks n' eventsArr dbgMap ++
---                  tagsFromLocalIPs n' eventsArr rangeMap unitMap dbgMap ++
                   tagsFromLocalIPs2 n' eventsArr rangeMap dbgMap
           
       -- Update selection, if possible
@@ -578,30 +492,6 @@ findLocalIPsWeighted startIx eventsArr rangeMap =
       (w1, _) `plus` (w2, r) = (w1+w2, r)
   in nubSumBy ord plus wips
 
-tagsFromLocalIPs :: Int -> EventsArray -> RangeMap -> UnitMap -> DbgMap -> [Tag]
-tagsFromLocalIPs startIx eventsArr rangeMap unitMap dbgMap =
-  let toTag freq ObjRange{..} = Tag {
-        tagModule = case lookup raUnit unitMap of
-           Just unit       -> Just unit
-           _ | null raUnit -> Nothing   
-             | otherwise   -> Just $ takeFileName raUnit,
-        tagName = Just name,
-        tagTick = fmap fromIntegral tk,
-        tagDebug = tk >>= \i -> lookupDbgInstr i dbgMap,
-        tagFreq = freq
-        } where (name, tk) = decodeName raName
-                
-      weighted = findLocalIPsWeighted startIx eventsArr rangeMap
-      grandSum = sum $ map fst weighted
-      tags = map (uncurry toTag . first (/grandSum)) weighted
-      
-      msr Tag{..}
-        | Just ti <- tagTick  = Left ti
-        | otherwise           = Right (tagModule, tagName)
-      ord = compare `F.on` msr
-      t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }
-  in nubSumBy ord plus tags
-
 tagsFromLocalIPs2 :: Int -> EventsArray -> RangeMap -> DbgMap -> [Tag]
 tagsFromLocalIPs2 startIx eventsArr rangeMap unitMap =
   let toTag freq ObjRange{..}
@@ -621,7 +511,7 @@ tagsFromLocalIPs2 startIx eventsArr rangeMap unitMap =
               }
             Nothing -> Tag {
               tagModule = Nothing,
-              tagName = Just $ if is_haskell_like then "(Haskell)" else "(Misc)",
+              tagName = Just $ if is_haskell_like then "(Haskell)" else "(" ++ raName ++ ")",
               tagTick = Nothing,
               tagDebug = Nothing,
               tagFreq = freq
@@ -733,32 +623,25 @@ updateTextTags SourceView{..} = do
   state <- readIORef stateRef
   case state of
     StateLoaded{..}
-      | Just modName <- currentMod
-      , Just cixMap <- lookup modName cixMaps
-      , Just mix <- lookup modName mixData -> do
+      | Just modName <- currentMod -> do
 
         -- Clear existing tags
         clearTextTags sourceBuffer
 
         -- Annotate source code
         let filterLocal = filter ((== currentMod) . tagModule)
-        annotateTags sourceView sourceBuffer cixMap mix (filterLocal tags) False
+        annotateTags sourceView sourceBuffer (filterLocal tags) False
         case selection of
          Nothing  -> return ()
-         Just sel -> annotateTags sourceView sourceBuffer cixMap mix (filterLocal [sel]) True
+         Just sel -> annotateTags sourceView sourceBuffer (filterLocal [sel]) True
 
     _ -> return ()
 
-annotateTags :: GtkSourceView.SourceView -> SourceBuffer -> CixMap -> Mix -> [Tag] -> Bool -> IO ()
-annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
+annotateTags :: GtkSourceView.SourceView -> SourceBuffer -> [Tag] -> Bool -> IO ()
+annotateTags sourceView sourceBuffer tags sel = do
   tagTable <- textBufferGetTagTable sourceBuffer
 
-  let freqMap   = [(tagFreq, (lvl, fromHpcPos $ fst $ mixe !! stick))
-                  | Tag{tagFreq, tagTick = Just tick} <- tags
-                  , Just fragments <- [lookup (fromIntegral tick) cixMap]
-                  , (lvl, sticks) <- zip [-1,-2..] fragments
-                  , stick <- sticks]
-      freqMap2 = [(tagFreq, (1, srcs))
+  let freqMap2 = [(tagFreq, (1, srcs))
                  | Tag {tagFreq, tagDebug = Just dbg} <- tags
                  , srcs <- extSources dbg ]
       extSources DebugEntry { dbgSources, dbgDName = Nothing, dbgParent = Just p}
@@ -766,7 +649,7 @@ annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
       extSources DebugEntry { dbgSources}
         = dbgSources
       freqMap'  = nubSumBy (compare `F.on` snd) (\(f1, _) (f2, t) -> (f1+f2,t)) 
-                  (freqMap ++ freqMap2)
+                  freqMap2
   
   -- "Safe" version of textBufferGetIterAtLineOffset
   lineCount <- textBufferGetLineCount sourceBuffer
@@ -807,7 +690,7 @@ annotateTags sourceView sourceBuffer cixMap (Mix _ _ _ _ mixe) tags sel = do
     return ()
       
 -------------------------------------------------------------------------------
-
+#ifdef HAVE_CIX
 deriving instance Eq CixType
 deriving instance Ord CixType
 deriving instance Eq CixInfo
@@ -902,7 +785,7 @@ elimSubranges (Mix _ _ _ _ mixe) = go []
 -- | Like @rawCixMap@, but removes subranges in source ticks
 mkCixMap :: CixTree -> Mix -> (CixMap, CoreMap)
 mkCixMap cix mix = first (map $ second $ map $ elimSubranges mix) $ rawCixMap cix mix
-    
+#endif
 -------------------------------------------------------------------------------
 
 showCore :: SourceView -> IO ()
@@ -913,9 +796,7 @@ showCore SourceView{..} = do
     StateLoaded{..} 
       | Just tag <- selection
       , Just mod <- tagModule tag
-      , Just core <- (join $ lookup <$> (fromIntegral <$> tagTick tag)
-                                    <*> lookup mod coreMaps) `mappend`
-                     (tagDebug tag >>= dbgDCore >>= return . snd) -> do
+      , Just core <- (tagDebug tag >>= dbgDCore >>= return . snd) -> do
 
         clearTextTags sourceBuffer
         textBufferSetText sourceBuffer (cleanupCore core)

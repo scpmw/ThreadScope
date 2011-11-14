@@ -174,33 +174,33 @@ sourceViewNew builder SourceViewActions{..} = do
            -> name
          _ -> intercalate " / " (maybe [] (\m->[m]) tagModule ++ 
                                  maybe [] (\m->[m]) (findName tagDebug))]
-  
+
   let srcView    = SourceView {..}
-  
+
   -- Register events
   on tagsTreeView cursorChanged $
     updateTagSelection srcView
-    
+
   on tagsTreeView rowActivated $ \_ _ -> do
     showCore srcView
-    
+
   return srcView
 
 sourceViewSetEvents :: SourceView -> Maybe FilePath -> Maybe EventsArray -> IO ()
 sourceViewSetEvents SourceView{..} m_file m_data = do
   writeIORef stateRef =<< case (m_file, m_data) of
     (Just file, Just eventsArr) -> do
-      
+
       -- Search dirs
       curDir <- getCurrentDirectory
       searchDirs <- nub <$> mapM canonicalizePath [takeDirectory file, curDir]
-      
+
       -- Load ranges from the executable
       let exeName = dropExtension file
       putStr $ "Loading ranges from " ++ exeName ++ "... "
       ipRanges <- readObjRanges exeName
       putStrLn $ show (length ipRanges) ++ " ranges found"
-      
+
       -- Find source files
       putStr $ "Searching sources... "
       (fileMap, unitMap) <-
@@ -208,23 +208,23 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
           [ raUnit | ObjRange {raUnit} <- ipRanges, 
             takeExtension raUnit == ".hs" || takeExtension raUnit == ".lhs"]
       putStrLn $ show (length fileMap) ++ " files found: " ++ show fileMap
-      
-      -- Build range map      
+
+      -- Build range map
       let rangeMap = buildRangeMap ipRanges
-      
+
       let dbgMap = buildDbgMap eventsArr
-          
+
       let tags = tagsFromLocalTicks 0 eventsArr dbgMap ++
                  tagsFromLocalIPs2 0 eventsArr rangeMap dbgMap
           selection = Nothing
           currentMod = Nothing
-          
+
       return StateLoaded {..}
-    
+
     _other -> return StateEmpty
-      
+
 ------------------------------------------------------------------------------
-    
+
 searchGen :: (FilePath -> IO Bool) -> [FilePath] -> FilePath -> IO (Maybe FilePath)
 searchGen _    []         _    = return Nothing
 searchGen test (dir:dirs) name = do
@@ -511,7 +511,7 @@ tagsFromLocalIPs2 startIx eventsArr rangeMap unitMap =
               }
             Nothing -> Tag {
               tagModule = Nothing,
-              tagName = Just $ if is_haskell_like then "(Haskell)" else "(" ++ raName ++ ")",
+              tagName = Just raName, -- $ if is_haskell_like then "(Haskell)" else "(" ++ raName ++ ")",
               tagTick = Nothing,
               tagDebug = Nothing,
               tagFreq = freq
@@ -854,20 +854,17 @@ buildDbgMap arr = dbgMap
       DebugModule { file }
         -> go mname file moff es xs
       DebugProcedure { instr, parent, label }
-        -> let (name, srcs, core) = go_proc Nothing [] Nothing es
+        -> let (name, srcs, ranges, core) = go_proc Nothing [] Nothing es
                p_entry = parent >>= \i -> lookupDbgInstr (fI i) dbgMap
                entry = DebugEntry { dbgModule = mname
                                   , dbgFile = mfile
-                                  , dbgLabel = hackLabel label
+                                  , dbgLabel = label
                                   , dbgDName = name
                                   , dbgInstr = fmap (fI.(+moff).fI) instr
                                   , dbgParent = p_entry
                                   , dbgSources = srcs
                                   , dbgDCore = core
                                   }
-               -- TODO: Hack! Find out why this is needed!
-               hackLabel lbl | "sat_" `isPrefixOf` lbl = drop 4 lbl
-               hackLabel lbl = lbl
            in go mname mfile moff es (entry:xs)
       _other -> go mname mfile moff es xs
     go_proc name srcs core [] = (name, reverse srcs, core)

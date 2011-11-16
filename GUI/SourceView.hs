@@ -5,12 +5,12 @@ module GUI.SourceView (
   SourceView,
   sourceViewNew,
   SourceViewActions(..),
-  
+
   Tag,
-  
+
   sourceViewSetEvents,
   --sourceViewSelectTag,
-  
+
   sourceViewSetCursor,
   ) where
 
@@ -89,8 +89,8 @@ data Tag = Tag {
 
 instance Eq Tag where
   (Tag m1 n1 t1 _ _) == (Tag m2 n2 t2 _ _)  = m1 == m2 && (n1 == n2 || t1 == t2)
-  
-data SourceViewState 
+
+data SourceViewState
   = StateEmpty
   | StateLoaded {
     eventsArr  :: EventsArray,
@@ -102,16 +102,16 @@ data SourceViewState
     selection  :: Maybe Tag,
     currentMod :: Maybe String
   }
-    
+
 -- | TODO after prototype crunch. This would make a lot more sense...
 {--
-data SourceModule = 
+data SourceModule =
   { mixData :: Mix
   , cixData :: CixTree
   , cixMap :: CixMap
   }
 --}
-   
+
 data SourceViewActions = SourceViewActions {
   --sourceViewRedraw :: IO ()
   }
@@ -170,7 +170,7 @@ sourceViewNew builder SourceViewActions{..} = do
       findName Nothing = Nothing
   cellLayoutSetAttributes tagDescCol tagDescRender tagsStore $ \Tag{..} ->
     [ cellText := case (tagDebug, tagName) of
-         (Nothing, Just name) 
+         (Nothing, Just name)
            -> name
          _ -> intercalate " / " (maybe [] (\m->[m]) tagModule ++ 
                                  maybe [] (\m->[m]) (findName tagDebug))]
@@ -268,23 +268,23 @@ sourceViewSetCursor view@SourceView {..} n = do
   state <- readIORef stateRef
   case state of
     StateLoaded{..} -> do
-      
+
       -- Load tags for new position
       let n' = clampBounds (bounds eventsArr) n
           tags' = tagsFromLocalTicks n' eventsArr dbgMap ++
                   tagsFromLocalIPs2 n' eventsArr rangeMap dbgMap
-          
+
       -- Update selection, if possible
       let selection' = selection >>= (\t -> find (== t) tags')
-      
+
       -- Set new state
       writeIORef stateRef state{ tags=tags', selection=selection' }
-      
+
       -- Update views
       updateTagsView tagsStore tags'
       setTagSelection view selection'
       showModule view "Main"
-    
+
     _ -> clearAll view
 
 clearAll :: SourceView -> IO ()
@@ -369,14 +369,14 @@ splitGlobalTick n = ("Main", n) -- TODO!
 
 findLocalTicks :: Int -> EventsArray -> [(String, Word32, Double)]
 findLocalTicks startIx eventsArr =
-  
+
   -- Find ticks around start point
   let winMid        = time $ ce_event $ eventsArr ! startIx
       samples       = findLocalTickSamples startIx eventsArr
-      
+
       -- Weight them by distance to start point
       weighted      = map (uncurry $ weightTicks winMid) samples
-      
+
       -- Sum up weighted frequencies by tick IDs
       summed        = nubSumBy (compare `F.on` fst) (\(t,w1) (_,w2)->(t,w1+w2)) $ concat weighted
       grandSum      = sum $ map snd summed
@@ -414,9 +414,9 @@ ipSampleWinSize = 50 * 1000 * 1000
 ipSampleStdDev  = 20 * 1000 * 1000
 
 -- | Lookup an instruction pointer in the range map.
-lookupRange :: RangeMap -> Int -> Maybe ObjRange
-lookupRange rangeMap ip 
-  = case IM.splitLookup ip rangeMap of  
+lookupRange :: RangeMap -> Int -> Maybe DebugEntry
+lookupRange rangeMap ip
+  = case IM.splitLookup ip rangeMap of
     (_, Just r, _)           -> Just r
     (lowerRanges, _, _)
       | IM.null lowerRanges  -> Nothing
@@ -479,14 +479,14 @@ findLocalIPsWeighted :: Int -> EventsArray -> RangeMap -> [(Double, ObjRange)]
 findLocalIPsWeighted startIx eventsArr rangeMap =
   let -- Find samples
       ipss = findLocalIPsamples startIx eventsArr
-      
+
       -- Give each range a weight
       winMid = time $ ce_event $ eventsArr ! startIx
       weight = sampleWeight winMid ipSampleStdDev
       toWeighted t = first ((* weight t) . fromIntegral)
       worker (t, ips) = map (toWeighted t) $ lookupRanges rangeMap ips
       wips = concatMap worker ipss
-      
+
       -- Combine duplicated ranges
       ord = compare `F.on` (raLow . snd)
       (w1, _) `plus` (w2, r) = (w1+w2, r)
@@ -586,17 +586,17 @@ clearTextTags sourceBuffer = do
   tagList <- readIORef tagListRef
   mapM_ (textTagTableRemove tagTable) tagList-}
   return ()
-  
+
 showModule :: SourceView -> String -> IO ()
 showModule view@SourceView{..} modName = do
   state <- readIORef stateRef
   clearTextTags sourceBuffer
-  
+
   case state of
     StateLoaded{..} 
       | Just file <- lookup modName fileMap -> 
         when (currentMod /= Just modName) $ do
-      
+
           -- Load the source file
           modSrc <- readFile file
           textBufferSetText sourceBuffer modSrc
@@ -606,13 +606,12 @@ showModule view@SourceView{..} modName = do
 
           -- Update tagging
           updateTextTags view
-        
+
     StateLoaded{} -> do
       writeIORef stateRef state{ currentMod = Nothing }
       textBufferSetText sourceBuffer $
-        " *** Could not find source code or Mix/Cix data. " ++
-        "Make sure all of it is accessible from the event log's path! ***"
-      
+        " *** Could not find source code for this tag! ***"
+
     StateEmpty -> do
       writeIORef stateRef state{ currentMod = Nothing }
       textBufferSetText sourceBuffer ""
@@ -650,7 +649,7 @@ annotateTags sourceView sourceBuffer tags sel = do
         = dbgSources
       freqMap'  = nubSumBy (compare `F.on` snd) (\(f1, _) (f2, t) -> (f1+f2,t)) 
                   freqMap2
-  
+
   -- "Safe" version of textBufferGetIterAtLineOffset
   lineCount <- textBufferGetLineCount sourceBuffer
   let textBufferGetIterAtLineOffsetSafe l c
@@ -671,14 +670,14 @@ annotateTags sourceView sourceBuffer tags sel = do
             | True = "#" ++ ws w ++ ws w ++ ws w
     set tag [textTagBackground := clr, textTagBackgroundSet := True]
     tagTable `textTagTableAdd` tag
-      
+
       -- Place at code position
     start <- textBufferGetIterAtLineOffsetSafe (sl-1) (sc-1)
     end <- textBufferGetIterAtLineOffsetSafe (el-1) ec
     textBufferApplyTag sourceBuffer tag start end
-    
+
     --putStrLn $ "Annotating " ++ show (sl, sc, el, ec) ++ " with " ++ clr ++ "(lvl " ++ show lvl ++ ")"
-  
+
   -- Scroll to largest tick
   let ticks = map (snd . snd) freqMap'
   when (sel && not (null ticks)) $ do
@@ -793,7 +792,7 @@ showCore SourceView{..} = do
   state <- readIORef stateRef  
 
   case state of
-    StateLoaded{..} 
+    StateLoaded{..}
       | Just tag <- selection
       , Just mod <- tagModule tag
       , Just core <- (tagDebug tag >>= dbgDCore >>= return . snd) -> do

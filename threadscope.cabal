@@ -22,8 +22,7 @@ Executable threadscope
                      binary, array, mtl, filepath,
                      ghc-events >= 0.2,
                      containers >= 0.2 && < 0.5,
-                     parse-objdump >= 0.1,
-                     hpc, directory
+                     directory
   extensions:        RecordWildCards, NamedFieldPuns,
                      BangPatterns, PatternGuards,
                      CPP

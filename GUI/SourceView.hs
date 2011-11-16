@@ -20,16 +20,14 @@ import Graphics.UI.Gtk
 import Graphics.UI.Gtk.SourceView hiding (SourceView, sourceViewNew)
 import qualified Graphics.UI.Gtk.SourceView as GtkSourceView
 
-import Text.Objdump  (ObjRangeType(..), ObjRange(..), readObjRanges)
-
 import Data.Array
 import Data.IORef
 import Data.Maybe (mapMaybe, catMaybes, fromMaybe)
 import Data.List
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import qualified Data.Function as F
 import qualified Data.IntMap as IM
-import Data.Char (isDigit, ord, isSpace)
+import Data.Char (isSpace)
 
 import System.FilePath
 import System.Directory (doesFileExist,getCurrentDirectory,canonicalizePath)
@@ -44,6 +42,8 @@ import Text.Printf
 
 import Paths_threadscope (getDataFileName)
 
+import Debug.Trace
+
 -------------------------------------------------------------------------------
 
 data SourceView = SourceView {
@@ -55,20 +55,22 @@ data SourceView = SourceView {
   }
 
 data DebugEntry = DebugEntry {
+  dbgId :: {-# UNPACK #-} !Int, -- for quick identification checks
   dbgModule :: String,
   dbgFile :: String,
   dbgLabel :: String,
+  dbgRanges :: [(Int, Int)],
   dbgDName :: Maybe String,
   dbgInstr :: Maybe Int,
   dbgParent :: Maybe DebugEntry,
-  dbgSources :: [(Int, Int, Int, Int)],
+  dbgSources :: [(Int, Int, Int, Int, String)],
   dbgDCore :: Maybe (String, String)
   } deriving Show
 
 type EventsArray = Array Int CapEvent
 type FileMap = [(String, FilePath)]
 type UnitMap = [(FilePath, String)]
-type RangeMap = IM.IntMap ObjRange
+type RangeMap = IM.IntMap DebugEntry
 type DbgMap = [DebugEntry]
 
 data Tag = Tag {
@@ -80,7 +82,7 @@ data Tag = Tag {
   tagName :: Maybe String,
   -- | Tick number of the tag. This is only set if there's a Haskell
   -- expression the tag could be mapped to
-  tagTick :: Maybe Word32,
+  tagTick :: Maybe Int,
   -- | Debug data available for the tag
   tagDebug :: Maybe DebugEntry,
   -- | Approximate frequency of the tag getting hit
@@ -154,7 +156,7 @@ sourceViewNew builder SourceViewActions{..} = do
 
   (tagFreqCol, tagFreqRender) <- mkColumn "%"
   (tagDescCol, tagDescRender) <- mkColumn "Name"
-  (tagNameCol, tagNameRender) <- mkColumn "Core"
+  (tagCoreCol, tagCoreRender) <- mkColumn "Core"
 
   -- Set column content
   treeViewSetModel tagsTreeView tagsStore
@@ -163,17 +165,21 @@ sourceViewNew builder SourceViewActions{..} = do
     [ cellText := printf "%02.1f" (tagFreq * 100) ]
   --cellLayoutSetAttributes tagTickCol tagTickRender tagsStore $ \Tag{..} ->
   --  [ cellText := maybe "" show tagTick ]
-  cellLayoutSetAttributes tagNameCol tagNameRender tagsStore $ \Tag{..} ->
-    [ cellText := fromMaybe "" (fst <$> (tagDebug >>= dbgDCore)) ]
-  let findName (Just (DebugEntry { dbgDName = Just name})) = Just name
-      findName (Just (DebugEntry { dbgParent })) = findName dbgParent
-      findName Nothing = Nothing
+
+  -- Go up in tree until element was found
+  let findElem f (Just dbg)  | r@(Just _) <- f dbg = r
+      findElem f (Just (DebugEntry { dbgParent })) = findElem f dbgParent
+      findElem _ Nothing                           = Nothing
+
+  cellLayoutSetAttributes tagCoreCol tagCoreRender tagsStore $ \Tag{..} ->
+    [ cellText := fromMaybe "" (fst <$> (findElem dbgDCore tagDebug)) ]
   cellLayoutSetAttributes tagDescCol tagDescRender tagsStore $ \Tag{..} ->
     [ cellText := case (tagDebug, tagName) of
          (Nothing, Just name)
            -> name
-         _ -> intercalate " / " (maybe [] (\m->[m]) tagModule ++ 
-                                 maybe [] (\m->[m]) (findName tagDebug))]
+         _ -> intercalate " / " (maybe [] (\m->[m]) tagModule ++
+                                 maybe [] (\m->[m]) (findElem dbgDName tagDebug))
+    ]
 
   let srcView    = SourceView {..}
 
@@ -195,27 +201,22 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
       curDir <- getCurrentDirectory
       searchDirs <- nub <$> mapM canonicalizePath [takeDirectory file, curDir]
 
-      -- Load ranges from the executable
-      let exeName = dropExtension file
-      putStr $ "Loading ranges from " ++ exeName ++ "... "
-      ipRanges <- readObjRanges exeName
-      putStrLn $ show (length ipRanges) ++ " ranges found"
-
-      -- Find source files
-      putStr $ "Searching sources... "
-      (fileMap, unitMap) <-
-        findSourceFiles searchDirs $ nub $
-          [ raUnit | ObjRange {raUnit} <- ipRanges, 
-            takeExtension raUnit == ".hs" || takeExtension raUnit == ".lhs"]
-      putStrLn $ show (length fileMap) ++ " files found: " ++ show fileMap
-
-      -- Build range map
-      let rangeMap = buildRangeMap ipRanges
-
+      -- Load debug data from event log
       let dbgMap = buildDbgMap eventsArr
 
+      -- Build range map
+      let rangeMap = buildRangeMap dbgMap
+      putStrLn $ printf "Range map has %d entries" (IM.size rangeMap)
+
+      -- Find source files
+      (fileMap, unitMap) <-
+        findSourceFiles searchDirs $ nub $
+          [ f | DebugEntry { dbgSources } <- dbgMap
+              , (_,_,_,_,f) <- dbgSources ]
+      putStrLn $ printf "Located %d source files" (length fileMap)
+
       let tags = tagsFromLocalTicks 0 eventsArr dbgMap ++
-                 tagsFromLocalIPs2 0 eventsArr rangeMap dbgMap
+                 tagsFromLocalIPs2 0 eventsArr rangeMap
           selection = Nothing
           currentMod = Nothing
 
@@ -272,7 +273,7 @@ sourceViewSetCursor view@SourceView {..} n = do
       -- Load tags for new position
       let n' = clampBounds (bounds eventsArr) n
           tags' = tagsFromLocalTicks n' eventsArr dbgMap ++
-                  tagsFromLocalIPs2 n' eventsArr rangeMap dbgMap
+                  tagsFromLocalIPs2 n' eventsArr rangeMap
 
       -- Update selection, if possible
       let selection' = selection >>= (\t -> find (== t) tags')
@@ -364,10 +365,7 @@ weightTicks mid time = map (second f)
   where f hitCount = fromIntegral hitCount * weight
         weight     = sampleWeight mid tickSampleStdDev time
 
-splitGlobalTick :: Word32 -> (String, Word32)
-splitGlobalTick n = ("Main", n) -- TODO!
-
-findLocalTicks :: Int -> EventsArray -> [(String, Word32, Double)]
+findLocalTicks :: Int -> EventsArray -> [(Word32, Double)]
 findLocalTicks startIx eventsArr =
 
   -- Find ticks around start point
@@ -381,21 +379,19 @@ findLocalTicks startIx eventsArr =
       summed        = nubSumBy (compare `F.on` fst) (\(t,w1) (_,w2)->(t,w1+w2)) $ concat weighted
       grandSum      = sum $ map snd summed
       normalized    = map (second (/ grandSum)) summed
-      
-      -- Get module information for each tick
-      splitTs (n,f) = let (mo,n') = splitGlobalTick n in (mo, n', f)
-      
-  in map splitTs normalized
+
+  in normalized
 
 tagsFromLocalTicks :: Int -> EventsArray -> DbgMap -> [Tag]
 tagsFromLocalTicks startIx eventsArr dbgMap = map toTag $ findLocalTicks startIx eventsArr
-  where toTag (mod, tick, freq) = Tag {
-          tagModule = Just mod,
-          tagName   = Nothing,
-          tagTick   = Just tick,
-          tagDebug  = lookupDbgInstr (fromIntegral tick) dbgMap,
-          tagFreq   = freq
-          }
+  where toTag (tick, freq) =
+          let dbg = lookupDbgInstr (fromIntegral tick) dbgMap
+          in Tag { tagModule = fmap dbgModule dbg
+                 , tagName   = Nothing
+                 , tagTick   = Just (fromIntegral tick)
+                 , tagDebug  = dbg
+                 , tagFreq   = freq
+                 }
 
 -------------------------------------------------------------------------------
 
@@ -419,39 +415,46 @@ lookupRange rangeMap ip
   = case IM.splitLookup ip rangeMap of
     (_, Just r, _)           -> Just r
     (lowerRanges, _, _)
-      | IM.null lowerRanges  -> Nothing
+      | IM.null lowerRanges  -> traceShow ip $ Nothing
       | (_, r) <- IM.findMax lowerRanges
-        , ip < fI (raHigh r) -> Just r
-      | otherwise            -> Nothing
-  where fI = fromIntegral
+        , any (\(l, h) -> l <= ip && ip < h) (dbgRanges r)
+                             -> Just r
+      | otherwise            -> traceShow ip $ Nothing
 
-buildRangeMap :: [ObjRange] -> IM.IntMap ObjRange
-buildRangeMap ranges =
-  let sorted = sortBy (compare `F.on` raLow) ranges
-      
-      -- Scans range list and inserts all ranges into a map. 
-      down :: [ObjRange] -> [ObjRange] -> [(Integer, ObjRange)]
+buildRangeMap :: [DebugEntry] -> IM.IntMap DebugEntry
+buildRangeMap dbgs =
+  let -- Convert input into a tuple list with one entry per range. Sort.
+      ranges = [ (fromIntegral l, fromIntegral h, dbg)
+               | dbg <- dbgs, (l, h) <- dbgRanges dbg ]
+      low  (l,_,_) = l
+      high (_,h,_) = h
+      dbg  (_,_,d) = d
+      sorted = sortBy (compare `F.on` low) ranges
+
+      -- Scans range list and inserts all ranges into a map.
+      down :: [(Int, Int, DebugEntry)] -> [(Int, Int, DebugEntry)]
+              -> [(Int, DebugEntry)]
       down []     []              = []
-      down (s:ss) []              = up ss []     (raHigh s)
-      down []     (r:rs)          = (raLow r, r) : (down [r] rs)
+      down (s:ss) []              =                   up ss []     (high s)
+      down []     (r:rs)          = (low r, dbg r) : (down [r] rs)
       down (s:ss) (r:rs)
-        | raHigh s <= raLow r     = up ss (r:rs) (raHigh s)
-        | SymbolRange <- raType r =                 down (s:ss) rs
-        | otherwise               = (raLow r, r) : (down (r:s:ss) rs)
-      
+        | high s <= low r         =                   up ss (r:rs) (high s)
+        | otherwise               = (low r, dbg r) : (down (r:s:ss) rs)
+
       -- Called to remove items from the stack, maybe re-inserting
       -- some ranges that were overriden but still apply. Will revert
       -- to "down" behaviour once no more ranges can be popped from
       -- the stack.
-      up :: [ObjRange] -> [ObjRange] -> Integer ->  [(Integer, ObjRange)]
-      up []     rs _   =           down [] rs
-      up (s:ss) rs p 
-        | raHigh s > p = (p, s) : (down (s:ss) rs)
-        | otherwise    =           up   ss rs p
-  
-  in IM.fromAscList $ map (first fromInteger) $ down [] sorted
-      
-findLocalIPsamples :: Int -> EventsArray -> [(Timestamp, [Word32])]
+      up :: [(Int, Int, DebugEntry)] -> [(Int, Int, DebugEntry)] -> Int
+            -> [(Int, DebugEntry)]
+      up []     rs _   =               down [] rs
+      up (s:ss) rs p
+        | high s > p   = (p, dbg s) : (down (s:ss) rs)
+        | otherwise    =               up   ss rs p
+
+  in IM.fromAscList (down [] sorted)
+
+findLocalIPsamples :: Int -> EventsArray -> [(Timestamp, [Word64])]
 findLocalIPsamples startIx eventsArr =
   let getIPs CapEvent{{-ce_cap,-}ce_event=Event{time,spec=InstrPtrSample{..}}}
         = Just ({- ce_cap, -}time, ips)
@@ -462,10 +465,10 @@ findLocalIPsamples startIx eventsArr =
   in findLocalEvents startIx ipSampleWinSize eventsArr getIPs
 
 -- | Looks up a number of ranges, groups together same ranges
-lookupRanges :: RangeMap -> [Word32] -> [(Int, ObjRange)]
-lookupRanges rangeMap ips = 
-  let ranges = mapMaybe (lookupRange rangeMap . fromIntegral) ips
-      ord = compare `F.on` (raLow . snd)
+lookupRanges :: RangeMap -> [Word64] -> [(Int, Maybe DebugEntry)]
+lookupRanges rangeMap ips =
+  let ranges = map (lookupRange rangeMap . fromIntegral) ips
+      ord = compare `F.on` (fmap dbgId . snd)
       _ `plus` (n, r) = (n+1, r)
   in nubSumBy ord plus $ map ((,) 1) ranges
 
@@ -475,7 +478,7 @@ nubSumBy ord plus = map (foldr1 plus) . groupBy eq . sortBy ord
   where x `eq` y = ord x y == EQ
 
 -- | Finds local IP samples, return weighted
-findLocalIPsWeighted :: Int -> EventsArray -> RangeMap -> [(Double, ObjRange)]
+findLocalIPsWeighted :: Int -> EventsArray -> RangeMap -> [(Double, Maybe DebugEntry)]
 findLocalIPsWeighted startIx eventsArr rangeMap =
   let -- Find samples
       ipss = findLocalIPsamples startIx eventsArr
@@ -488,69 +491,34 @@ findLocalIPsWeighted startIx eventsArr rangeMap =
       wips = concatMap worker ipss
 
       -- Combine duplicated ranges
-      ord = compare `F.on` (raLow . snd)
+      ord = compare `F.on` (fmap dbgId . snd)
       (w1, _) `plus` (w2, r) = (w1+w2, r)
   in nubSumBy ord plus wips
 
-tagsFromLocalIPs2 :: Int -> EventsArray -> RangeMap -> DbgMap -> [Tag]
-tagsFromLocalIPs2 startIx eventsArr rangeMap unitMap =
-  let toTag freq ObjRange{..}
-        = let m_dbg = lookupDbgLabel (takeFileName raUnit) (zdecode raName) unitMap
-              m_dbg_r = redirect m_dbg
-              redirect (Just DebugEntry{ dbgDCore = Nothing, dbgParent }) = redirect dbgParent
-              redirect other = other
-              is_haskell_like
-                = any (`isSuffixOf` raName) ["_info","_static","_con","_slow"]
-          in case m_dbg_r of
-            Just (DebugEntry {..}) -> Tag {
-              tagModule = Just dbgModule,
-              tagName = Just $ zdecode dbgLabel,
-              tagTick = Nothing,
-              tagDebug = m_dbg_r,
-              tagFreq = freq
+tagsFromLocalIPs2 :: Int -> EventsArray -> RangeMap -> [Tag]
+tagsFromLocalIPs2 startIx eventsArr rangeMap =
+  let toTag freq (Just dbg@DebugEntry{..})
+        = Tag { tagModule = Just dbgModule
+              , tagName = Just $ zdecode dbgLabel
+              , tagTick = dbgInstr
+              , tagDebug = Just dbg
+              , tagFreq = freq
               }
-            Nothing -> Tag {
-              tagModule = Nothing,
-              tagName = Just raName, -- $ if is_haskell_like then "(Haskell)" else "(" ++ raName ++ ")",
-              tagTick = Nothing,
-              tagDebug = Nothing,
-              tagFreq = freq
+      toTag freq Nothing
+        = Tag { tagModule = Nothing
+              , tagName = Just "(unrecognized)"
+              , tagTick = Nothing
+              , tagDebug = Nothing
+              , tagFreq = freq
               }
 
       weighted = findLocalIPsWeighted startIx eventsArr rangeMap
       grandSum = sum $ map fst weighted
       tags = map (uncurry toTag . first (/grandSum)) weighted
 
-      msr Tag{..}
-        | Just ti <- tagTick  = Left ti
-        | otherwise           = Right (tagModule, tagName)
-      ord = compare `F.on` msr
+      ord = compare `F.on` (fmap dbgId . tagDebug)
       t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }
   in nubSumBy ord plus tags
-
-
--- | Names in the symbol table have some extra information in them, as
--- well as often standing for actual Haskell names. We try to process
--- and sanitize the names a bit here.
-decodeName :: String -> (String, Maybe Int)
-decodeName s = (sanitize s', m_i)
-  where    
-    
-    -- This is *hilariously* crude
-    (s', m_i)
-      | Just (s', i) <- splt_go (reverse s) 0 1
-        = (s', Just i)        
-      | otherwise  = (s, Nothing)
-    splt_go ('k':'c':'i':'t':'i':'_':cs) i _ = Just (reverse cs, i)
-    splt_go (c:cs) i m | isDigit c = splt_go cs (i+m*(ord c-ord '0')) (m*10)
-    splt_go _ _ _ = Nothing
-    
-    sanitize s
-      | "_info" `isSuffixOf` s = zdecode $ take (length s - 5) s
-      | "_static" `isSuffixOf` s = zdecode $ take (length s - 7) s
-      | "_con"  `isSuffixOf` s = zdecode $ take (length s - 4) s
-      | "_slow" `isSuffixOf` s = zdecode $ take (length s - 5) s
-      | otherwise              = zdecode $ s
 
 zdecode :: String -> String
 zdecode ('z':'a':cs) = '&':zdecode cs
@@ -657,9 +625,9 @@ annotateTags sourceView sourceBuffer tags sel = do
         | otherwise = do iter <- textBufferGetIterAtLine sourceBuffer l
                          textIterForwardChars iter c
                          return iter
-        
-  forM_ freqMap' $ \(freq, (lvl, (sl, sc, el, ec))) -> when (sel || lvl == 1) $ do
-        
+
+  forM_ freqMap' $ \(freq, (lvl, (sl, sc, el, ec, f))) -> when (sel || lvl == 1) $ do
+
     -- Create color tag
     tag <- textTagNew Nothing
     let w = min 230 $ max 0 $ 255 - round (100 * freq)
@@ -681,115 +649,18 @@ annotateTags sourceView sourceBuffer tags sel = do
   -- Scroll to largest tick
   let ticks = map (snd . snd) freqMap'
   when (sel && not (null ticks)) $ do
-    let hpcSize (sl, sc, el, ec) = (el-sl, ec-sc)
+    let hpcSize (sl, sc, el, ec, _) = (el-sl, ec-sc)
         largestTick = maximumBy (compare `F.on` hpcSize) ticks
-        (l, c, _, _) = largestTick
+        (l, c, _, _, _) = largestTick
     iter <- textBufferGetIterAtLineOffset sourceBuffer (l-1) (c-1)
     _ <- textViewScrollToIter sourceView iter 0.2 Nothing
     return ()
-      
--------------------------------------------------------------------------------
-#ifdef HAVE_CIX
-deriving instance Eq CixType
-deriving instance Ord CixType
-deriving instance Eq CixInfo
-deriving instance Ord CixInfo
 
-simplifyCix :: CixTree -> CixTree
-simplifyCix (CixTree cis cts code)
-  | null cts 
-    || M.null overlaps 
-    || length (snd bestOverlap) <= 1
-                 = CixTree cis (map simplifyCix cts) code
-  | otherwise    = simplifyCix (CixTree cis cts' code)
-  where
-    
-    sourceInfos (CixTree cis _ _) = mapMaybe getSource cis
-    getSource ci@(CixInfo CixSource _ _) = Just ci
-    getSource _                          = Nothing
-        
-    -- Map from source ticks to child nodes that contain them
-    overlaps :: M.Map CixInfo [CixTree]
-    overlaps = foldl' addOverlaps M.empty cts
-    addOverlaps m ct = foldl' f m (sourceInfos ct)
-      where f m i = M.insertWith (++) i [ct] m
-    
-    -- Source tick that appears in most nodes
-    bestOverlap = maximumBy (compare `F.on` (length . snd)) $ M.assocs overlaps
-    
-    -- Source ticks shared by all nodes containing the "best" source tick
-    sharedOverlap = foldl1 intersect $ map sourceInfos $ snd bestOverlap
-    
-    -- Move all children with overlap into a new node
-    removeOverlap (CixTree cis cts code) = CixTree (filter (not . (`elem` sharedOverlap)) cis) cts code
-    newNode = CixTree sharedOverlap (map removeOverlap $ snd bestOverlap) Nothing
-    
-    -- Remove all moved nodes
-    filtered = filter (\n -> not $ all (`elem` sourceInfos n) sharedOverlap) cts
-    cts' = newNode : filtered
-  
--- | Takes Cix and Mix information and finds which instrumentation
--- ticks could be associated with which source ticks.
-rawCixMap :: CixTree -> Mix -> (CixMap, CoreMap)
-rawCixMap cix _mix = snd $ go [] cix
-  where
-    
-    goSum :: [([Int], (CixMap, CoreMap))] -> ([Int], (CixMap, CoreMap))
-    goSum = foldr plus ([],([],[]))
-      where plus (ctxd1, (cxm1, cdm1)) (ctxd2, (cxm2, cdm2)) 
-              = (ctxd1 ++ ctxd2, (cxm1 ++ cxm2, cdm1 ++ cdm2))
-    
-    getSrcTick (CixInfo CixSource _ n) = n
-    getSrcTick (CixInfo CixInstrument _ _) = error "Funny place for an instrumentation tick..."
-
-    -- Go through tree. For each instrumentation tick, give context:
-    -- 1) All source ticks directly below
-    -- 2) All source ticks on the path to the root
-    -- The list is segmented by instrumentation ticks encountered
-    go :: [[Int]] -> CixTree -> ([Int], (CixMap, CoreMap))
-    go ctxUp (CixTree ((CixInfo CixInstrument _ n):cis) cxs m_cd) =
-      -- On instrumentation tick, we segment the list: Add another
-      -- segment no matter what (so source ticks farther down might
-      -- get added to it!)
-      let srcs = map getSrcTick cis
-          ctxUp' = srcs:ctxUp
-          (ctxDown, (cxm, cdm)) = goSum $ map (go ctxUp') cxs
-          -- Create new entries for cix and core map. Note we filter
-          -- empty segments as well as duplicated source code ticks.
-          cxm' = (n, filter (not . null) $ map nub $ (srcs++ctxDown):ctxUp):cxm
-          cdm' | Just cd <- m_cd = (n, cd):cdm
-               | otherwise       = cdm
-      in ([], (cxm', cdm'))
-    go ctxUp (CixTree cis cxs _) =
-      -- We have no instrumentation tick, therefore don't segment:
-      -- Just add source ticks to last segment seen
-      let srcs = map getSrcTick cis
-          {-ctxUp' = case ctxUp of 
-            (ctxHd:ctxTl)  -> (ctxHd ++ srcs):ctxTl
-            [] | null srcs -> []
-               | otherwise -> [srcs]-}
-          ctxUp' = srcs:ctxUp
-          (ctx2, (cxm, cdm)) = goSum $ map (go ctxUp') cxs
-      in (ctx2 ++ srcs, (cxm, cdm))
-
--- | Given a list of source tick IDs, eliminates all ranges that are a
--- subrange of another range in the array.
-elimSubranges :: Mix -> [Int] -> [Int]
-elimSubranges (Mix _ _ _ _ mixe) = go []
-  where 
-    go ns2 []     = ns2
-    go ns2 (n:ns) = go (n:filter f ns2) (filter f ns)
-      where f n2 = not (fst (mixe !! n2) `insideHpcPos` fst (mixe !! n))
-
--- | Like @rawCixMap@, but removes subranges in source ticks
-mkCixMap :: CixTree -> Mix -> (CixMap, CoreMap)
-mkCixMap cix mix = first (map $ second $ map $ elimSubranges mix) $ rawCixMap cix mix
-#endif
 -------------------------------------------------------------------------------
 
 showCore :: SourceView -> IO ()
 showCore SourceView{..} = do
-  state <- readIORef stateRef  
+  state <- readIORef stateRef 
 
   case state of
     StateLoaded{..}
@@ -837,47 +708,48 @@ clampBounds (lower, upper) x
 lookupDbgInstr :: Int -> DbgMap -> Maybe DebugEntry
 lookupDbgInstr instr = find ((== Just instr) . dbgInstr)
 
-lookupDbgLabel :: String -> String -> DbgMap -> Maybe DebugEntry
-lookupDbgLabel file lbl = find (\de -> dbgLabel de == lbl && dbgFile de == file)
-
 buildDbgMap :: EventsArray -> DbgMap
 buildDbgMap arr = dbgMap
   where
-    dbgMap = go "" "" 0 (elems arr) []
-    go _     _     _    []     xs = xs
-    go mname mfile moff (e:es) xs = case spec $ ce_event e of
+    dbgMap = go "" "" 0 0 (elems arr) []
+    go _     _     _     _ []     xs = xs
+    go mname mfile moff !i (e:es) xs = case spec $ ce_event e of
       CreateThread {}
         -> xs -- Don't expect any further debug data
       HpcModule { modName, modBase }
-        -> go modName (modName ++ ".hs") modBase es xs
+        -> go modName (modName ++ ".hs") modBase i es xs
       DebugModule { file }
-        -> go mname file moff es xs
+        -> go mname file moff i es xs
       DebugProcedure { instr, parent, label }
-        -> let (name, srcs, ranges, core) = go_proc Nothing [] Nothing es
+        -> let (name, srcs, ranges, core) = go_proc Nothing [] [] Nothing es
                p_entry = parent >>= \i -> lookupDbgInstr (fI i) dbgMap
-               entry = DebugEntry { dbgModule = mname
+               entry = DebugEntry { dbgId = i
+                                  , dbgModule = mname
                                   , dbgFile = mfile
                                   , dbgLabel = label
+                                  , dbgRanges = ranges
                                   , dbgDName = name
                                   , dbgInstr = fmap (fI.(+moff).fI) instr
                                   , dbgParent = p_entry
                                   , dbgSources = srcs
                                   , dbgDCore = core
                                   }
-           in go mname mfile moff es (entry:xs)
-      _other -> go mname mfile moff es xs
-    go_proc name srcs core [] = (name, reverse srcs, core)
-    go_proc name srcs core (e:es) = case spec $ ce_event e of
-      DebugSource { sline, scol, eline, ecol }
-        -> go_proc name ((fI sline, fI scol, fI eline, fI ecol):srcs) core es
+           in go mname mfile moff (i+1) es (entry:xs)
+      _other -> go mname mfile moff i es xs
+    go_proc name srcs ranges core [] = (name, reverse srcs, ranges, core)
+    go_proc name srcs ranges core (e:es) = case spec $ ce_event e of
+      DebugSource { sline, scol, eline, ecol, file }
+        -> go_proc name ((fI sline, fI scol, fI eline, fI ecol, file):srcs) ranges core es
+      DebugPtrRange { low, high }
+        -> go_proc name srcs ((fromIntegral low, fromIntegral high):ranges) core es
       DebugCore { coreBind, coreCode } | core == Nothing
-        -> go_proc name srcs (Just (coreBind, coreCode)) es
+        -> go_proc name srcs ranges (Just (coreBind, coreCode)) es
       DebugName { dbgName } | name == Nothing
-        -> go_proc (Just dbgName) srcs core es
+        -> go_proc (Just dbgName) srcs ranges core es
       DebugProcedure {} -> stop
       CreateThread {} -> stop
       _other
-        -> go_proc name srcs core es
-      where stop = (name, reverse srcs, core)
+        -> go_proc name srcs ranges core es
+      where stop = (name, reverse srcs, ranges, core)
     fI :: (Integral a, Integral b) => a -> b
     fI = fromIntegral

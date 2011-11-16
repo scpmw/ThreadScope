@@ -105,23 +105,23 @@ blockMarker = 18
 
 testEventTypes :: [EventType]
 testEventTypes
-  = [EventType create "Create thread" (Just 8),
-     EventType runThread "Run thread" (Just 8),
-     EventType stop "Stop thread" (Just 10),
-     EventType runnable "Thread runnable" (Just 8),
-     EventType migrate "Migrate thread" (Just 10),
-     EventType runSpark "Run spark" (Just 8),
-     EventType stealSpark "Steal spark" (Just 10),
-     EventType shutdown "Shutdown" (Just 0),
-     EventType wakeup "Wakeup thread" (Just 10),
-     EventType startGC "Start GC" (Just 0),
-     EventType finishGC "Finish GC" (Just 0),
-     EventType reqSeqGC "Request sequetial GC" (Just 0),
-     EventType reqParGC "Reqpargc parallel GC" (Just 0),
-     EventType createSparkThread "Create spark thread" (Just 8),
-     EventType logMessage "Log message" Nothing,
-     EventType startup "Startup" (Just 0),
-     EventType blockMarker "Block marker" (Just 14)
+  = [EventType create "Create thread" [] (Just 8),
+     EventType runThread "Run thread" [] (Just 8),
+     EventType stop "Stop thread" [] (Just 10),
+     EventType runnable "Thread runnable" [] (Just 8),
+     EventType migrate "Migrate thread" [] (Just 10),
+     EventType runSpark "Run spark" [] (Just 8),
+     EventType stealSpark "Steal spark" [] (Just 10),
+     EventType shutdown "Shutdown" [] (Just 0),
+     EventType wakeup "Wakeup thread" [] (Just 10),
+     EventType startGC "Start GC" [] (Just 0),
+     EventType finishGC "Finish GC" [] (Just 0),
+     EventType reqSeqGC "Request sequetial GC" [] (Just 0),
+     EventType reqParGC "Reqpargc parallel GC" [] (Just 0),
+     EventType createSparkThread "Create spark thread" [] (Just 8),
+     EventType logMessage "Log message" [] Nothing,
+     EventType startup "Startup" [] (Just 0),
+     EventType blockMarker "Block marker" [] (Just 14)
     ]
 
 -------------------------------------------------------------------------------

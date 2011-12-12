@@ -56,8 +56,7 @@ data SourceView = SourceView {
 
 data DebugEntry = DebugEntry {
   dbgId :: {-# UNPACK #-} !Int, -- for quick identification checks
-  dbgModule :: String,
-  dbgFile :: String,
+  dbgUnit :: String,
   dbgLabel :: String,
   dbgRanges :: [(Int, Int)],
   dbgDName :: Maybe String,
@@ -68,15 +67,13 @@ data DebugEntry = DebugEntry {
   } deriving Show
 
 type EventsArray = Array Int CapEvent
-type FileMap = [(String, FilePath)]
 type UnitMap = [(FilePath, String)]
 type RangeMap = IM.IntMap DebugEntry
 type DbgMap = [DebugEntry]
 
 data Tag = Tag {
-  -- | Module this tag belongs to. If @Nothing@, the tag could not be
-  -- assigned to a module (e.g. a global symbol)
-  tagModule :: Maybe String,
+  -- | Compilation unit this tag belongs to
+  tagUnit :: Maybe String,
   -- | Name of the tag. If @Nothing@, the tag does not have a name, as
   -- will be the case for most Haskell expressions
   tagName :: Maybe String,
@@ -96,23 +93,20 @@ data SourceViewState
   = StateEmpty
   | StateLoaded {
     eventsArr  :: EventsArray,
-    fileMap    :: FileMap,                  -- ^ Map from all loaded modules to their actual file names
-    unitMap    :: UnitMap,                  -- ^ Maps compilation unit names (from ranges) to module names
+    unitMap    :: UnitMap,      -- ^ Maps compilation unit names (from ranges) to actual file names
     dbgMap     :: DbgMap,
     rangeMap   :: RangeMap,
     tags       :: [Tag],
     selection  :: Maybe Tag,
-    currentMod :: Maybe String
+    currentUnit:: Maybe String
   }
 
--- | TODO after prototype crunch. This would make a lot more sense...
-{--
-data SourceModule =
-  { mixData :: Mix
-  , cixData :: CixTree
-  , cixMap :: CixMap
-  }
---}
+-- | Prefix for unknown compilation units - where the only reference
+-- we could come up with came from the symbol table of a binary file
+-- (which, sadly, is not enough to reliably locate source files even
+-- with FILE entries)
+symTabPrefix :: String
+symTabPrefix = "SYMTAB: "
 
 data SourceViewActions = SourceViewActions {
   --sourceViewRedraw :: IO ()
@@ -155,6 +149,7 @@ sourceViewNew builder SourceViewActions{..} = do
         return (col, render)
 
   (tagFreqCol, tagFreqRender) <- mkColumn "%"
+  (tagModCol, tagModRender)   <- mkColumn "Module"
   (tagDescCol, tagDescRender) <- mkColumn "Name"
   (tagCoreCol, tagCoreRender) <- mkColumn "Core"
 
@@ -167,18 +162,31 @@ sourceViewNew builder SourceViewActions{..} = do
   --  [ cellText := maybe "" show tagTick ]
 
   -- Go up in tree until element was found
-  let findElem f (Just dbg)  | r@(Just _) <- f dbg = r
-      findElem f (Just (DebugEntry { dbgParent })) = findElem f dbgParent
-      findElem _ Nothing                           = Nothing
 
   cellLayoutSetAttributes tagCoreCol tagCoreRender tagsStore $ \Tag{..} ->
-    [ cellText := fromMaybe "" (fst <$> (findElem dbgDCore tagDebug)) ]
+    [ cellText := fromMaybe "" (fst <$> (findDbgElem dbgDCore tagDebug)) ]
+  cellLayoutSetAttributes tagModCol tagModRender tagsStore $ \Tag{..} ->
+    [ cellText :=
+      let -- If the compilation unit is "SYMTAB", this is a pseudo
+          -- module inserted by GHC for procedure ranges it found but
+          -- couldn't map to a piece of Haskell code. We show the name
+          -- of the binary the symbol came from in that case.
+      in case fmap dbgUnit tagDebug of
+            Just m | symTabPrefix `isPrefixOf` m
+                     -> "(" ++ takeFileName (drop (length symTabPrefix) m) ++ ")"
+                   | otherwise
+                     -> takeFileName m
+            Nothing  -> "(?)"
+    ]
   cellLayoutSetAttributes tagDescCol tagDescRender tagsStore $ \Tag{..} ->
-    [ cellText := case (tagDebug, tagName) of
-         (Nothing, Just name)
-           -> name
-         _ -> intercalate " / " (maybe [] (\m->[m]) tagModule ++
-                                 maybe [] (\m->[m]) (findElem dbgDName tagDebug))
+    [ cellText := case findDbgElem dbgDName tagDebug of
+          -- We either get the name from an annotation, or we use the
+          -- label used for the procedure in the binary symbol table
+         Just n -> n
+         _ | Just l <- fmap dbgLabel tagDebug
+                -> "(" ++ zdecode l ++ ")"
+           | otherwise
+                -> "(?)"
     ]
 
   let srcView    = SourceView {..}
@@ -209,16 +217,18 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
       putStrLn $ printf "Range map has %d entries" (IM.size rangeMap)
 
       -- Find source files
-      (fileMap, unitMap) <-
-        findSourceFiles searchDirs $ nub $
-          [ f | DebugEntry { dbgSources } <- dbgMap
-              , (_,_,_,_,f) <- dbgSources ]
-      putStrLn $ printf "Located %d source files" (length fileMap)
+      let units = nub $
+                  [ f | DebugEntry { dbgSources } <- dbgMap
+                      , (_,_,_,_,f) <- dbgSources ] ++
+                  [ f | DebugEntry { dbgUnit = f } <- dbgMap ]
+      unitMap <- findSourceFiles searchDirs units
+      mapM print unitMap
+      putStrLn $ printf "Located %d out of %d source files" (length unitMap) (length units)
 
       let tags = tagsFromLocalTicks 0 eventsArr dbgMap ++
                  tagsFromLocalIPs2 0 eventsArr rangeMap
           selection = Nothing
-          currentMod = Nothing
+          currentUnit = Nothing
 
       return StateLoaded {..}
 
@@ -229,9 +239,10 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
 searchGen :: (FilePath -> IO Bool) -> [FilePath] -> FilePath -> IO (Maybe FilePath)
 searchGen _    []         _    = return Nothing
 searchGen test (dir:dirs) name = do
-  full_name <- canonicalizePath (combine dir name)
+  full_name <- catch (canonicalizePath (combine dir name))
+               (\_ -> return name)
   ex <- test full_name
-  if ex 
+  if ex
     then return (Just full_name)
     else searchGen test dirs name
 
@@ -239,28 +250,9 @@ searchFile{-, searchDirectory-} :: [FilePath] -> FilePath -> IO (Maybe FilePath)
 searchFile = searchGen doesFileExist
 --searchDirectory = searchGen doesDirectoryExist
 
-findSourceFiles :: [FilePath] -> [FilePath] -> IO (FileMap, UnitMap)
-findSourceFiles searchDirs sources = unzip . catMaybes <$> mapM findSource sources
- where 
-   findSource source = do
-     -- Look for the source file
-     m_file <- searchFile searchDirs source
-     case m_file of
-       Nothing -> return Nothing -- There simply must be a way to get around this. MaybeT?
-       Just file -> do
-         m_name <- getModuleName file
-         case m_name of
-           Nothing -> return Nothing
-           Just name -> return $ Just ((name, file), (source, name))
-
--- | Extracts the module name from a haskell source file. *Very*
--- naive, should be improved.
-getModuleName :: FilePath -> IO (Maybe String)
-getModuleName file = do
-  let searchName ("module":name:_) = Just name
-      searchName (_:xs)            = searchName xs
-      searchName []                = Nothing
-  searchName . words <$> readFile file
+findSourceFiles :: [FilePath] -> [FilePath] -> IO UnitMap
+findSourceFiles searchDirs sources = catMaybes <$> mapM findSource sources
+ where findSource source = ((,) source <$>) <$> searchFile searchDirs source
 
 ------------------------------------------------------------------------------
 
@@ -284,7 +276,6 @@ sourceViewSetCursor view@SourceView {..} n = do
       -- Update views
       updateTagsView tagsStore tags'
       setTagSelection view selection'
-      showModule view "Main"
 
     _ -> clearAll view
 
@@ -296,10 +287,11 @@ clearAll SourceView{..} = do
 updateTagsView :: ListStore Tag -> [Tag] -> IO ()
 updateTagsView tagsStore tags = do
   listStoreClear tagsStore
-  let sorted = sortBy (flip (compare `F.on` tagFreq)) tags  
+  let subsumed = subsumeTags tags
+      sorted = sortBy (flip (compare `F.on` tagFreq)) subsumed
   forM_ sorted $ \tag -> do
     listStoreAppend tagsStore tag
-    
+
 setTagSelection :: SourceView -> Maybe Tag -> IO ()
 setTagSelection SourceView{..} m_tag = do
   tagSelect <- treeViewGetSelection tagsTreeView
@@ -307,11 +299,11 @@ setTagSelection SourceView{..} m_tag = do
   case flip elemIndex tagsShown =<< m_tag of
     Just ix -> treeSelectionSelectPath tagSelect [ix]
     Nothing -> treeSelectionUnselectAll tagSelect
-    
+
 updateTagSelection :: SourceView -> IO ()
 updateTagSelection view@SourceView{..} = do
   state <- readIORef stateRef
-  tagSelect <- treeViewGetSelection tagsTreeView  
+  tagSelect <- treeViewGetSelection tagsTreeView
   case state of
     StateLoaded{..} -> do
       m_iter <- treeSelectionGetSelected tagSelect
@@ -322,14 +314,13 @@ updateTagSelection view@SourceView{..} = do
         selection = select'
         }
       -- Update view
-      let mod | Just (Tag { tagModule = Just mod}) <- select' 
-              = mod
-              | otherwise
-              = "Main"
-      showModule view mod
-      updateTextTags view
+      case tagUnit =<< select' of
+        Just unit -> do
+          showUnit view unit
+          updateTextTags view
+        Nothing -> return ()
     _ -> return ()
-  
+
 ------------------------------------------------------------------------------
 
 findLocalEvents :: Int -> Timestamp -> EventsArray -> (CapEvent -> Maybe a) -> [a]
@@ -386,7 +377,7 @@ tagsFromLocalTicks :: Int -> EventsArray -> DbgMap -> [Tag]
 tagsFromLocalTicks startIx eventsArr dbgMap = map toTag $ findLocalTicks startIx eventsArr
   where toTag (tick, freq) =
           let dbg = lookupDbgInstr (fromIntegral tick) dbgMap
-          in Tag { tagModule = fmap dbgModule dbg
+          in Tag { tagUnit   = dbgUnit <$> dbg
                  , tagName   = Nothing
                  , tagTick   = Just (fromIntegral tick)
                  , tagDebug  = dbg
@@ -415,11 +406,13 @@ lookupRange rangeMap ip
   = case IM.splitLookup ip rangeMap of
     (_, Just r, _)           -> Just r
     (lowerRanges, _, _)
-      | IM.null lowerRanges  -> traceShow ip $ Nothing
+      | IM.null lowerRanges  -> trace msg $ Nothing
       | (_, r) <- IM.findMax lowerRanges
         , any (\(l, h) -> l <= ip && ip < h) (dbgRanges r)
                              -> Just r
-      | otherwise            -> traceShow ip $ Nothing
+      | otherwise            -> trace msg $ Nothing
+
+  where msg = printf "Could not place IP %08x" ip
 
 buildRangeMap :: [DebugEntry] -> IM.IntMap DebugEntry
 buildRangeMap dbgs =
@@ -498,14 +491,14 @@ findLocalIPsWeighted startIx eventsArr rangeMap =
 tagsFromLocalIPs2 :: Int -> EventsArray -> RangeMap -> [Tag]
 tagsFromLocalIPs2 startIx eventsArr rangeMap =
   let toTag freq (Just dbg@DebugEntry{..})
-        = Tag { tagModule = Just dbgModule
+        = Tag { tagUnit = Just dbgUnit
               , tagName = Just $ zdecode dbgLabel
               , tagTick = dbgInstr
               , tagDebug = Just dbg
               , tagFreq = freq
               }
       toTag freq Nothing
-        = Tag { tagModule = Nothing
+        = Tag { tagUnit = Nothing
               , tagName = Just "(unrecognized)"
               , tagTick = Nothing
               , tagDebug = Nothing
@@ -555,33 +548,46 @@ clearTextTags sourceBuffer = do
   mapM_ (textTagTableRemove tagTable) tagList-}
   return ()
 
-showModule :: SourceView -> String -> IO ()
-showModule view@SourceView{..} modName = do
+showUnit :: SourceView -> String -> IO ()
+showUnit view@SourceView{..} unit = do
   state <- readIORef stateRef
   clearTextTags sourceBuffer
 
   case state of
-    StateLoaded{..} 
-      | Just file <- lookup modName fileMap -> 
-        when (currentMod /= Just modName) $ do
+    StateLoaded{..}
+      | Just file <- lookup unit unitMap ->
+        when (currentUnit /= Just unit) $ do
 
           -- Load the source file
           modSrc <- readFile file
           textBufferSetText sourceBuffer modSrc
 
           -- Set state
-          writeIORef stateRef state{ currentMod = Just modName }
+          writeIORef stateRef state{ currentUnit = Just unit }
 
           -- Update tagging
           updateTextTags view
 
-    StateLoaded{} -> do
-      writeIORef stateRef state{ currentMod = Nothing }
+    -- We only have a symbol name and the file name to the binary?
+    -- That's expected for binaries without debug info. Explain this
+    -- to the user.
+    StateLoaded{selection} | Just Tag{tagName = Just n} <- selection
+                           , symTabPrefix `isPrefixOf` unit -> do
+      writeIORef stateRef state{ currentUnit = Nothing }
       textBufferSetText sourceBuffer $
-        " *** Could not find source code for this tag! ***"
+        " *** Symbol from binary file ***\n\n" ++
+        "No source code info could be found...\n" ++
+        "This code was probably compiled without debugging annotations.\n\n" ++
+        "Binary: " ++ drop (length symTabPrefix) unit ++ "\n" ++
+        "Symbol: " ++ n
+
+    StateLoaded{} -> do
+      writeIORef stateRef state{ currentUnit = Nothing }
+      textBufferSetText sourceBuffer $
+        " *** Could not find source code for " ++ unit ++ "! ***"
 
     StateEmpty -> do
-      writeIORef stateRef state{ currentMod = Nothing }
+      writeIORef stateRef state{ currentUnit = Nothing }
       textBufferSetText sourceBuffer ""
 
 updateTextTags :: SourceView -> IO ()
@@ -589,14 +595,13 @@ updateTextTags SourceView{..} = do
 
   state <- readIORef stateRef
   case state of
-    StateLoaded{..}
-      | Just modName <- currentMod -> do
+    StateLoaded{..} -> do
 
         -- Clear existing tags
         clearTextTags sourceBuffer
 
         -- Annotate source code
-        let filterLocal = filter ((== currentMod) . tagModule)
+        let filterLocal = filter ((== currentUnit) . tagUnit)
         annotateTags sourceView sourceBuffer (filterLocal tags) False
         case selection of
          Nothing  -> return ()
@@ -626,7 +631,7 @@ annotateTags sourceView sourceBuffer tags sel = do
                          textIterForwardChars iter c
                          return iter
 
-  forM_ freqMap' $ \(freq, (lvl, (sl, sc, el, ec, f))) -> when (sel || lvl == 1) $ do
+  forM_ freqMap' $ \(freq, (lvl, (sl, sc, el, ec, _))) -> when (sel || lvl == 1) $ do
 
     -- Create color tag
     tag <- textTagNew Nothing
@@ -660,18 +665,17 @@ annotateTags sourceView sourceBuffer tags sel = do
 
 showCore :: SourceView -> IO ()
 showCore SourceView{..} = do
-  state <- readIORef stateRef 
+  state <- readIORef stateRef
 
   case state of
     StateLoaded{..}
       | Just tag <- selection
-      , Just mod <- tagModule tag
-      , Just core <- (tagDebug tag >>= dbgDCore >>= return . snd) -> do
+      , Just core <- fmap snd (findDbgElem dbgDCore (tagDebug tag)) -> do
 
         clearTextTags sourceBuffer
         textBufferSetText sourceBuffer (cleanupCore core)
 
-        writeIORef stateRef state { currentMod = Nothing }
+        writeIORef stateRef state { currentUnit = Nothing }
 
     _ -> return ()
 
@@ -711,21 +715,20 @@ lookupDbgInstr instr = find ((== Just instr) . dbgInstr)
 buildDbgMap :: EventsArray -> DbgMap
 buildDbgMap arr = dbgMap
   where
-    dbgMap = go "" "" 0 0 (elems arr) []
-    go _     _     _     _ []     xs = xs
-    go mname mfile moff !i (e:es) xs = case spec $ ce_event e of
+    (imap, dbgMap) = go "" 0 0 imap (IM.empty) (elems arr) []
+
+    go _     _     _ _     iMapO []     xs = (iMapO, xs)
+    go mfile moff !i iMapI iMapO (e:es) xs = case spec $ ce_event e of
       CreateThread {}
-        -> xs -- Don't expect any further debug data
-      HpcModule { modName, modBase }
-        -> go modName (modName ++ ".hs") modBase i es xs
+        -> (iMapO, xs) -- Don't expect any further debug data
       DebugModule { file }
-        -> go mname file moff i es xs
+        -> let res = go file moff i (fst res) IM.empty es xs
+           in (iMapO, snd res)
       DebugProcedure { instr, parent, label }
         -> let (name, srcs, ranges, core) = go_proc Nothing [] [] Nothing es
-               p_entry = parent >>= \i -> lookupDbgInstr (fI i) dbgMap
+               p_entry = parent >>= flip IM.lookup iMapI . fI
                entry = DebugEntry { dbgId = i
-                                  , dbgModule = mname
-                                  , dbgFile = mfile
+                                  , dbgUnit = mfile
                                   , dbgLabel = label
                                   , dbgRanges = ranges
                                   , dbgDName = name
@@ -734,8 +737,12 @@ buildDbgMap arr = dbgMap
                                   , dbgSources = srcs
                                   , dbgDCore = core
                                   }
-           in go mname mfile moff (i+1) es (entry:xs)
-      _other -> go mname mfile moff i es xs
+               iMapO' = case instr of
+                 Just ix -> IM.insert (fI ix) entry iMapO
+                 Nothing -> iMapO
+           in go mfile moff (i+1) iMapI iMapO' es (entry:xs)
+      _other -> go mfile moff i iMapI iMapO es xs
+
     go_proc name srcs ranges core [] = (name, reverse srcs, ranges, core)
     go_proc name srcs ranges core (e:es) = case spec $ ce_event e of
       DebugSource { sline, scol, eline, ecol, file }
@@ -751,5 +758,27 @@ buildDbgMap arr = dbgMap
       _other
         -> go_proc name srcs ranges core es
       where stop = (name, reverse srcs, ranges, core)
+
     fI :: (Integral a, Integral b) => a -> b
     fI = fromIntegral
+
+-- | Searches for an entry having the given property by traversing the
+-- tree upwards. Returns the entry in question
+findWithDbgElem :: (DebugEntry -> Maybe a) -> Maybe DebugEntry -> Maybe DebugEntry
+findWithDbgElem f d@(Just dbg)    | Just _ <- f dbg = d
+findWithDbgElem f (Just (DebugEntry { dbgParent })) = findWithDbgElem f dbgParent
+findWithDbgElem _ Nothing                           = Nothing
+
+-- | As findWithDbgElem, but returns the value
+findDbgElem :: (DebugEntry -> Maybe a) -> Maybe DebugEntry -> Maybe a
+findDbgElem f = (>>= f) . findWithDbgElem f
+
+------------------------------------------------------------------------------
+
+-- | Subsume tags for the viewed list
+subsumeTags :: [Tag] -> [Tag]
+subsumeTags = nubSumBy cmp plus
+   where cmp = compare `F.on` (fmap fst . (>>= dbgDCore) . findWithDbgElem dbgDCore . tagDebug)
+         eitherLeft (Just a) _ = Left a
+         eitherLeft _ (Just b) = Right b
+         t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }

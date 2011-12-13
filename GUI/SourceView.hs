@@ -332,6 +332,40 @@ findLocalEvents n winSize eventsArr filter_f =
       eventsAfter   = eventsWhile (<winMid+winSize) [n,n+1..high]
   in mapMaybe filter_f eventsBefore ++ mapMaybe filter_f eventsAfter
 
+findLocalEventsCount :: Int -> Int -> EventsArray -> (CapEvent -> Maybe a) -> (a -> Int) -> [a]
+findLocalEventsCount n maxCount eventsArr filter_f count_f =
+  let winMid        = time $ ce_event $ eventsArr ! n
+      midDist e     = absDiff (time (ce_event e)) winMid
+      absDiff x y  = if x > y then x - y else y - x
+
+      -- Get events before and after point of interest
+      (low, high)   = bounds eventsArr
+      eventsBefore  = map (eventsArr !) [n-1,n-2..low]
+      eventsAfter   = map (eventsArr !) [n,n+1..high]
+
+      -- Combine events into a common list, sorted by distance to mid point
+      zippity [] as = as
+      zippity bs [] = bs
+      zippity (a:as) (b:bs)
+        | midDist a < midDist b
+                    = a:zippity as (b:bs)
+        | otherwise = b:zippity (a:as) bs
+      zippedEvents  = zippity eventsBefore eventsAfter
+
+      -- Filter the events
+      filteredEvents= mapMaybe filter_f zippedEvents
+
+      -- Accumulate using count_f how many samples each event
+      -- has. Stop once we have enough. Note that scanl adds the
+      -- initial accumulator to the list, so we actually get the index
+      -- of the first element where we go over the count.
+      returnCount   = findIndex (>maxCount) $
+                      scanl (\c x -> c + count_f x) 0 filteredEvents
+
+  in case returnCount of
+    Just ix   -> take ix filteredEvents
+    Nothing   -> filteredEvents
+
 -- Dumps are normally generated for every RTS timer event, which fires
 -- 50 times per second (= 20 ms).
 tickSampleWinSize, tickSampleStdDev :: Timestamp
@@ -399,6 +433,8 @@ tagsFromLocalTicks startIx eventsArr dbgMap = map toTag $ findLocalTicks startIx
 ipSampleWinSize, ipSampleStdDev :: Timestamp
 ipSampleWinSize = 50 * 1000 * 1000
 ipSampleStdDev  = 20 * 1000 * 1000
+ipSampleMaxCount :: Int
+ipSampleMaxCount = 1000
 
 -- | Lookup an instruction pointer in the range map.
 lookupRange :: RangeMap -> Int -> Maybe DebugEntry
@@ -455,7 +491,9 @@ findLocalIPsamples startIx eventsArr =
 --        = Just (time, [ip])
       getIPs _other
         = Nothing
-  in findLocalEvents startIx ipSampleWinSize eventsArr getIPs
+      count_f (_, ips) = length ips
+      samples = findLocalEventsCount startIx ipSampleMaxCount eventsArr getIPs count_f
+  in traceShow (map (second length) samples) samples
 
 -- | Looks up a number of ranges, groups together same ranges
 lookupRanges :: RangeMap -> [Word64] -> [(Int, Maybe DebugEntry)]
@@ -751,7 +789,7 @@ buildDbgMap arr = dbgMap
         -> go_proc name srcs ((fromIntegral low, fromIntegral high):ranges) core es
       DebugCore { coreBind, coreCode } | core == Nothing
         -> go_proc name srcs ranges (Just (coreBind, coreCode)) es
-      DebugName { dbgName } | name == Nothing
+      DebugName { dbgName } -- | name == Nothing
         -> go_proc (Just dbgName) srcs ranges core es
       DebugProcedure {} -> stop
       CreateThread {} -> stop
@@ -778,7 +816,9 @@ findDbgElem f = (>>= f) . findWithDbgElem f
 -- | Subsume tags for the viewed list
 subsumeTags :: [Tag] -> [Tag]
 subsumeTags = nubSumBy cmp plus
-   where cmp = compare `F.on` (fmap fst . (>>= dbgDCore) . findWithDbgElem dbgDCore . tagDebug)
-         eitherLeft (Just a) _ = Left a
-         eitherLeft _ (Just b) = Right b
+   where cmp = compare `F.on` (dbgCmpId . tagDebug)
+         dbgCmpId dbg = case findWithDbgElem dbgDCore dbg of
+           Just DebugEntry { dbgDCore = Just (n, _) }
+                       -> Left n
+           Nothing     -> Right (fmap dbgId dbg)
          t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }

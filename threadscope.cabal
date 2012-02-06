@@ -18,11 +18,11 @@ Synopsis:            A graphical thread profiler.
 Executable threadscope
   Main-is:           Main.hs
   Build-Depends:     base >= 4.0 && < 5, 
-                     gtk >= 0.11, cairo, glib, pango, gtksourceview2,
+                     gtk >= 0.11, cairo, glib, pango, gtksourceview2, transformers,
                      binary, array, mtl, filepath,
                      ghc-events >= 0.2,
                      containers >= 0.2 && < 0.5,
-                     directory
+                     directory, deepseq, bytestring
   extensions:        RecordWildCards, NamedFieldPuns,
                      BangPatterns, PatternGuards,
                      CPP

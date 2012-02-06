@@ -22,21 +22,24 @@ import qualified Graphics.UI.Gtk.SourceView as GtkSourceView
 
 import Data.Array
 import Data.IORef
-import Data.Maybe (mapMaybe, catMaybes, fromMaybe)
+import Data.Maybe (mapMaybe, fromMaybe)
 import Data.List
 import Data.Word (Word32, Word64)
 import qualified Data.Function as F
 import qualified Data.IntMap as IM
-import Data.Char (isSpace)
+import qualified Data.Map as Map
+import Data.Char (isSpace, chr)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as LBS
 
 import System.FilePath
 import System.Directory (doesFileExist,getCurrentDirectory,canonicalizePath)
 
 import Control.Monad (forM_, when)
-import Control.Applicative ((<$>))
+import Control.Applicative ((<$>), (<|>))
 import Control.Arrow (first, second)
-
-import Numeric (showHex)
+import Control.DeepSeq (deepseq, NFData(..))
+import Control.Monad.IO.Class (liftIO)
 
 import Text.Printf
 
@@ -46,30 +49,57 @@ import Debug.Trace
 
 -------------------------------------------------------------------------------
 
+data FileView = FileView {
+  sourceFile     :: FilePath,
+  sourceLoad     :: (IORef Bool),
+  sourcePage     :: Int,
+  sourceView     :: GtkSourceView.SourceView,
+  sourceBuffer   :: SourceBuffer
+  }
+
 data SourceView = SourceView {
-  stateRef     :: !(IORef SourceViewState),
-  sourceView   :: !GtkSourceView.SourceView,
-  sourceBuffer :: !SourceBuffer,
-  tagsStore    :: !(ListStore Tag),
-  tagsTreeView :: !TreeView
+  stateRef     :: (IORef SourceViewState),
+  sourceBook   :: Notebook,
+  coreView     :: GtkSourceView.SourceView,
+  coreBuffer   :: SourceBuffer,
+  sourceFont   :: FontDescription,
+  haskellLang  :: Maybe SourceLanguage,
+  tagsTreeView :: TreeView,
+  tagsStore    :: (ListStore Tag)
+  }
+
+data Span = Span {
+  fileName    :: String,
+  startLine   :: {-# UNPACK #-} !Int,
+  startCol    :: {-# UNPACK #-} !Int,
+  endLine     :: {-# UNPACK #-} !Int,
+  endCol      :: {-# UNPACK #-} !Int
+  } deriving (Eq, Ord)
+
+data IPRange = IPRange {
+  _rangeStart :: {-# UNPACK #-} !Int,
+  _rangeEnd   :: {-# UNPACK #-} !Int
   }
 
 data DebugEntry = DebugEntry {
-  dbgId :: {-# UNPACK #-} !Int, -- for quick identification checks
-  dbgUnit :: String,
-  dbgLabel :: String,
-  dbgRanges :: [(Int, Int)],
-  dbgDName :: Maybe String,
-  dbgInstr :: Maybe Int,
+  dbgId     :: {-# UNPACK #-} !Int, -- for quick identification checks
+  dbgUnit   :: String,
+  dbgLabel  :: String,
+  dbgRanges :: [IPRange],
+  dbgDName  :: Maybe String,
+  dbgInstr  :: Maybe Int,
   dbgParent :: Maybe DebugEntry,
-  dbgSources :: [(Int, Int, Int, Int, String)],
-  dbgDCore :: Maybe (String, String)
-  } deriving Show
+  dbgSources:: [Span],
+  dbgDCore  :: Maybe (String, LBS.ByteString)
+  }
+
+instance Eq DebugEntry where
+  e1 == e2  = dbgId e1 == dbgId e2
 
 type EventsArray = Array Int CapEvent
-type UnitMap = [(FilePath, String)]
 type RangeMap = IM.IntMap DebugEntry
 type DbgMap = [DebugEntry]
+type CoreMap = Map.Map (String, String) DebugEntry
 
 data Tag = Tag {
   -- | Compilation unit this tag belongs to
@@ -84,21 +114,38 @@ data Tag = Tag {
   tagDebug :: Maybe DebugEntry,
   -- | Approximate frequency of the tag getting hit
   tagFreq :: !Double
-  } deriving (Show)
+  }
 
 instance Eq Tag where
   (Tag m1 n1 t1 _ _) == (Tag m2 n2 t2 _ _)  = m1 == m2 && (n1 == n2 || t1 == t2)
 
+instance NFData Tag where
+  rnf Tag{..} = tagUnit `deepseq` tagName `deepseq` tagTick `deepseq` tagDebug `seq` ()
+
 data SourceViewState
-  = StateEmpty
-  | StateLoaded {
+  = SourceViewState {
     eventsArr  :: EventsArray,
-    unitMap    :: UnitMap,      -- ^ Maps compilation unit names (from ranges) to actual file names
     dbgMap     :: DbgMap,
     rangeMap   :: RangeMap,
+    coreMap    :: CoreMap,
     tags       :: [Tag],
     selection  :: Maybe Tag,
-    currentUnit:: Maybe String
+    files      :: [FileView],
+    searchDirs :: [FilePath],
+    lineTags   :: [Tag]
+  }
+
+initViewState :: SourceViewState
+initViewState = SourceViewState {
+  eventsArr = listArray (0,0) [],
+  dbgMap = [],
+  rangeMap = IM.empty,
+  coreMap = Map.empty,
+  tags = [],
+  selection = Nothing,
+  files = [],
+  searchDirs = [],
+  lineTags = []
   }
 
 -- | Prefix for unknown compilation units - where the only reference
@@ -114,27 +161,45 @@ data SourceViewActions = SourceViewActions {
 
 sourceViewNew :: Builder -> SourceViewActions -> IO SourceView
 sourceViewNew builder SourceViewActions{..} = do
-  stateRef <- newIORef StateEmpty
 
   let getWidget cast = builderGetObject builder cast
-  sourceView   <- getWidget castToSourceView "source"
+  sourceBook   <- getWidget castToNotebook "source_book"
+  coreView     <- getWidget castToSourceView "core"
   langManager  <- sourceLanguageManagerGetDefault
   searchPath   <- sourceLanguageManagerGetSearchPath langManager
   searchDir    <- getDataFileName "haskell.lang"
 
   -- Set monospace font for source view
-  fontDesc     <- fontDescriptionNew
-  fontDescriptionSetFamily fontDesc "Monospace"
-  widgetModifyFont sourceView (Just fontDesc)
+  sourceFont   <- fontDescriptionNew
+  fontDescriptionSetFamily sourceFont "Monospace"
+  widgetModifyFont coreView (Just sourceFont)
 
   -- Create source buffer using Haskell language specs
   sourceLanguageManagerSetSearchPath langManager
     (Just (takeDirectory searchDir : searchPath))
   haskellLang  <- sourceLanguageManagerGetLanguage langManager "haskell"
-  sourceBuffer <- case haskellLang of
+  coreBuffer <- case haskellLang of
     Just haskell -> sourceBufferNewWithLanguage haskell
-    Nothing      -> sourceBufferNew Nothing 
-  textViewSetBuffer sourceView sourceBuffer
+    Nothing      -> sourceBufferNew Nothing
+  textViewSetBuffer coreView coreBuffer
+
+  -- Lookup mark icons
+  sourceViewSetMarkCategoryIconFromStock coreView coreMarkCatFolded (Just stockAdd)
+  sourceViewSetMarkCategoryIconFromStock coreView coreMarkCatOpen (Just stockRemove)
+
+  -- Set up cost annotations for core view
+  costRenderer <- cellRendererTextNew
+  wdt <- getTextWidth coreView "100.0%"
+  set costRenderer [ cellTextSingleParagraphMode := True
+                   , cellTextBackgroundColor := Color 0xffff 0x0000 0x0000
+                   , cellTextBackgroundSet := True
+                   , cellTextEditable := False
+                   , cellTextAlignment := AlignRight
+                   , cellWidth := wdt
+                   ]
+  coreGutter <- sourceViewGetGutter coreView TextWindowLeft
+  sourceGutterInsert coreGutter costRenderer (-10)
+   -- sourceGutterSetCellSizeFunc coreGutter costRenderer 
 
   -- Create columns for tag list
   tagsTreeView <- getWidget castToTreeView "source_tagstree"
@@ -158,10 +223,6 @@ sourceViewNew builder SourceViewActions{..} = do
 
   cellLayoutSetAttributes tagFreqCol tagFreqRender tagsStore $ \Tag{..} ->
     [ cellText := printf "%02.1f" (tagFreq * 100) ]
-  --cellLayoutSetAttributes tagTickCol tagTickRender tagsStore $ \Tag{..} ->
-  --  [ cellText := maybe "" show tagTick ]
-
-  -- Go up in tree until element was found
 
   cellLayoutSetAttributes tagCoreCol tagCoreRender tagsStore $ \Tag{..} ->
     [ cellText := fromMaybe "" (fst <$> (findDbgElem dbgDCore tagDebug)) ]
@@ -189,16 +250,45 @@ sourceViewNew builder SourceViewActions{..} = do
                 -> "(?)"
     ]
 
+  stateRef <- newIORef initViewState
   let srcView    = SourceView {..}
 
   -- Register events
   on tagsTreeView cursorChanged $
     updateTagSelection srcView
+  on sourceBook switchPage $
+    updateFileView srcView
+  after coreView sourceViewLineMarkActivated $ \pos ->
+    liftIO $ activateMark srcView coreBuffer pos
 
-  on tagsTreeView rowActivated $ \_ _ -> do
-    showCore srcView
+  bgColor <- flip styleGetBackground StateNormal =<< widgetGetStyle coreView
+  sourceGutterSetCellDataFunc coreGutter costRenderer $ \_cell l _ -> do
+    SourceViewState{lineTags} <- readIORef stateRef
+    let (text, m) = case drop l lineTags of
+          Tag{..}:_ -> (printf "%02.1f" (tagFreq * 100) ++ "%",
+                        max 0 (1 + log tagFreq / 7))
+          _         -> ("-", 0)
+        mix m (Color r1 g1 b1) (Color r2 g2 b2)
+          = Color (round $ m * fromIntegral r1 + (1-m) * fromIntegral r2)
+                  (round $ m * fromIntegral g1 + (1-m) * fromIntegral g2)
+                  (round $ m * fromIntegral b1 + (1-m) * fromIntegral b2)
+        lColor = Color 0x0000 0xffff 0xffff
+    set costRenderer [ cellText := text
+                     , cellTextBackgroundColor := mix (m :: Double) lColor bgColor
+                     ]
 
   return srcView
+
+-- | Returns the width of the given string in pixel when rendered on
+-- screen. There is bound to be a better way of doing this, but I
+-- haven't been able to find it so far. Reserved so I can come back to
+-- this later.
+getTextWidth :: WidgetClass w => w -> String -> IO Int
+getTextWidth widget str = do
+  pango <- widgetGetPangoContext widget
+  layout <- layoutText pango str
+  (Rectangle _ _ wdt _, _) <- layoutGetPixelExtents layout
+  return wdt
 
 sourceViewSetEvents :: SourceView -> Maybe FilePath -> Maybe EventsArray -> IO ()
 sourceViewSetEvents SourceView{..} m_file m_data = do
@@ -211,28 +301,26 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
 
       -- Load debug data from event log
       let dbgMap = buildDbgMap eventsArr
+      putStrLn $ printf "Read debug data on %d procedures" (length dbgMap)
 
       -- Build range map
       let rangeMap = buildRangeMap dbgMap
       putStrLn $ printf "Range map has %d entries" (IM.size rangeMap)
 
-      -- Find source files
-      let units = nub $
-                  [ f | DebugEntry { dbgSources } <- dbgMap
-                      , (_,_,_,_,f) <- dbgSources ] ++
-                  [ f | DebugEntry { dbgUnit = f } <- dbgMap ]
-      unitMap <- findSourceFiles searchDirs units
-      mapM print unitMap
-      putStrLn $ printf "Located %d out of %d source files" (length unitMap) (length units)
+      -- Build core map
+      let coreMap = buildCoreMap dbgMap
+      putStrLn $ printf "Core map has %d entries" (Map.size coreMap)
 
+      -- Find initial tags
       let tags = tagsFromLocalTicks 0 eventsArr dbgMap ++
                  tagsFromLocalIPs2 0 eventsArr rangeMap
           selection = Nothing
-          currentUnit = Nothing
 
-      return StateLoaded {..}
+      let files = []
+          lineTags = []
+      return SourceViewState {..}
 
-    _other -> return StateEmpty
+    _other -> return initViewState
 
 ------------------------------------------------------------------------------
 
@@ -250,47 +338,120 @@ searchFile{-, searchDirectory-} :: [FilePath] -> FilePath -> IO (Maybe FilePath)
 searchFile = searchGen doesFileExist
 --searchDirectory = searchGen doesDirectoryExist
 
-findSourceFiles :: [FilePath] -> [FilePath] -> IO UnitMap
-findSourceFiles searchDirs sources = catMaybes <$> mapM findSource sources
- where findSource source = ((,) source <$>) <$> searchFile searchDirs source
+------------------------------------------------------------------------------
+
+-- | Returns a file view for the given file. Automatically creates the
+-- file view if it doesn't exist yet.
+fileViewGet :: SourceView -> FilePath -> IO FileView
+fileViewGet sourceView file = do
+
+  -- Look it up in the file list
+  SourceViewState {..} <- readIORef $ stateRef sourceView
+  case filter ((== file) . sourceFile) files of
+    (view:_) -> return view
+    []       -> fileViewNew sourceView file
+
+-- | Creates a source view tab for the given file.
+fileViewNew :: SourceView -> FilePath -> IO FileView
+fileViewNew SourceView { stateRef, haskellLang, sourceFont, sourceBook } sourceFile = do
+
+  -- Create source buffer
+  sourceBuffer <- case haskellLang of
+    Just haskell -> sourceBufferNewWithLanguage haskell
+    Nothing      -> sourceBufferNew Nothing
+
+  -- Create view
+  sourceView <- sourceViewNewWithBuffer sourceBuffer
+  set sourceView
+    [ textViewEditable := False
+    , sourceViewShowLineNumbers := True
+    ]
+  widgetModifyFont sourceView (Just sourceFont)
+
+  -- Create scrolled window to allow scrolling in view
+  scroll     <- scrolledWindowNew Nothing Nothing
+  containerAdd scroll sourceView
+
+  -- Create notebook page for the file
+  sourcePage <- notebookAppendPage sourceBook scroll $ takeFileName sourceFile
+
+  -- Show everything
+  widgetShowAll scroll
+
+  -- We don't actually load any content yet
+  sourceLoad <- newIORef False
+
+  -- Add to file view list
+  let fileView = FileView {..}
+  modifyIORef stateRef $ \state ->
+    state { files = files state ++ [fileView] }
+
+  return fileView
+
+showFile :: SourceView -> FileView -> IO ()
+showFile sview fview@FileView{..} = do
+
+  -- Text needs to be load in the first place?
+  isLoad <- readIORef sourceLoad
+  when (not isLoad) $ do
+
+    -- Find the source file
+    SourceViewState{searchDirs} <- readIORef $ stateRef sview
+    r <- searchFile searchDirs sourceFile
+    case r of
+      Just file -> do
+        -- Load the source file
+        modSrc <- BS.readFile file
+        textBufferSetByteString sourceBuffer modSrc
+        writeIORef sourceLoad True
+
+      Nothing ->
+        textBufferSetText sourceBuffer $
+          "Could not find source file " ++ sourceFile ++ "!"
+
+  -- Update tags
+  isLoad <- readIORef sourceLoad
+  when isLoad $
+    updateTextTags sview fview
+
+updateFileView :: SourceView -> Int -> IO ()
+updateFileView srcView@SourceView{stateRef} page = do
+
+  -- Find page
+  SourceViewState{files} <- readIORef stateRef
+  case find ((== page) . sourcePage) files of
+    Just fileView -> showFile srcView fileView
+    Nothing       -> return ()
 
 ------------------------------------------------------------------------------
 
 sourceViewSetCursor :: SourceView -> Int -> IO ()
 sourceViewSetCursor view@SourceView {..} n = do
-  state <- readIORef stateRef
-  case state of
-    StateLoaded{..} -> do
+  state@SourceViewState{..} <- readIORef stateRef
 
-      -- Load tags for new position
-      let n' = clampBounds (bounds eventsArr) n
-          tags' = tagsFromLocalTicks n' eventsArr dbgMap ++
-                  tagsFromLocalIPs2 n' eventsArr rangeMap
+  -- Load tags for new position
+  let n' = clampBounds (bounds eventsArr) n
+      tags' = tagsFromLocalTicks n' eventsArr dbgMap ++
+              tagsFromLocalIPs2 n' eventsArr rangeMap
 
-      -- Update selection, if possible
-      let selection' = selection >>= (\t -> find (== t) tags')
+  -- Update selection, if possible
+  let selection' = selection >>= (\t -> find (== t) tags')
 
-      -- Set new state
-      writeIORef stateRef state{ tags=tags', selection=selection' }
+  -- Set new state
+  tags' `deepseq` writeIORef stateRef state{ tags=tags', selection=selection' }
 
-      -- Update views
-      updateTagsView tagsStore tags'
-      setTagSelection view selection'
-
-    _ -> clearAll view
-
-clearAll :: SourceView -> IO ()
-clearAll SourceView{..} = do
-  listStoreClear tagsStore
-  textBufferSetText sourceBuffer ""
+  -- Update views
+  postGUISync $ do
+    updateTagsView tagsStore tags'
+    updateLineTags view
+    setTagSelection view selection'
 
 updateTagsView :: ListStore Tag -> [Tag] -> IO ()
 updateTagsView tagsStore tags = do
-  listStoreClear tagsStore
   let subsumed = subsumeTags tags
       sorted = sortBy (flip (compare `F.on` tagFreq)) subsumed
-  forM_ sorted $ \tag -> do
-    listStoreAppend tagsStore tag
+  listStoreClear tagsStore
+  mapM_ (listStoreAppend tagsStore) sorted
 
 setTagSelection :: SourceView -> Maybe Tag -> IO ()
 setTagSelection SourceView{..} m_tag = do
@@ -302,24 +463,61 @@ setTagSelection SourceView{..} m_tag = do
 
 updateTagSelection :: SourceView -> IO ()
 updateTagSelection view@SourceView{..} = do
-  state <- readIORef stateRef
+  state@SourceViewState{..} <- readIORef stateRef
+
+  -- Read selection from list view, write to state
   tagSelect <- treeViewGetSelection tagsTreeView
-  case state of
-    StateLoaded{..} -> do
-      m_iter <- treeSelectionGetSelected tagSelect
-      select' <- case m_iter of
+  m_iter <- treeSelectionGetSelected tagSelect
+  select' <- case m_iter of
         Just iter -> Just <$> listStoreGetValue tagsStore (listStoreIterToIndex iter)
         Nothing   -> return Nothing
-      writeIORef stateRef state{
-        selection = select'
-        }
-      -- Update view
-      case tagUnit =<< select' of
-        Just unit -> do
-          showUnit view unit
-          updateTextTags view
+  writeIORef stateRef state {
+    selection = select'
+    }
+
+  case select' of
+    Just tag -> do
+
+      -- Find files to show
+      let units = nub $
+                  (case tagUnit tag of
+                      Just unit -> [unit]
+                      Nothing -> []) ++
+                  (case tagDebug tag of
+                      Just dbg -> map fileName $ extSources dbg
+                      Nothing  -> [])
+      mapM_ (fileViewGet view) units
+
+      -- Update labels
+      updateFileBookLabels view
+
+      -- Show core
+      showCore view tag
+
+    Nothing ->
+      return ()
+
+-- | Resets the labels of file pages so they show how many tags can be
+-- found in the file in question
+updateFileBookLabels :: SourceView -> IO ()
+updateFileBookLabels SourceView {stateRef, sourceBook} = do
+  SourceViewState {files,selection} <- readIORef stateRef
+  forM_ files $ \f -> do
+    let tagsInFile = case selection of
+          Just tag -> case tagDebug tag of
+            Just dbg -> filter ((== sourceFile f) . fileName) $ extSources dbg
+            Nothing  -> []
+          Nothing -> []
+        title = takeFileName (sourceFile f) ++ suff
+        suff | null tagsInFile = ""
+             | otherwise       = " (" ++ show (length tagsInFile) ++ ")"
+    putStrLn title
+    page <- notebookGetNthPage sourceBook (sourcePage f)
+    case page of
+      Just p -> notebookGetTabLabel sourceBook p >>= \lbl -> case lbl of
+        Just l  -> labelSetText (castToLabel l) title
         Nothing -> return ()
-    _ -> return ()
+      Nothing -> print (sourcePage f)
 
 ------------------------------------------------------------------------------
 
@@ -382,7 +580,7 @@ findLocalTickSamples startIx eventsArr =
 
 -- | Weight to give to a sample. Simply the normal distribution.
 sampleWeight :: Timestamp -> Timestamp -> Timestamp -> Double
-sampleWeight mid dev val = 
+sampleWeight mid dev val =
   exp (fromIntegral ((val - mid) ^ 2) / fromIntegral (dev * dev))
 
 weightTicks :: Timestamp -> Timestamp -> [(Word32, Word32)] -> [(Word32, Double)]
@@ -444,7 +642,7 @@ lookupRange rangeMap ip
     (lowerRanges, _, _)
       | IM.null lowerRanges  -> trace msg $ Nothing
       | (_, r) <- IM.findMax lowerRanges
-        , any (\(l, h) -> l <= ip && ip < h) (dbgRanges r)
+        , any (\(IPRange l h) -> l <= ip && ip < h) (dbgRanges r)
                              -> Just r
       | otherwise            -> trace msg $ Nothing
 
@@ -454,7 +652,7 @@ buildRangeMap :: [DebugEntry] -> IM.IntMap DebugEntry
 buildRangeMap dbgs =
   let -- Convert input into a tuple list with one entry per range. Sort.
       ranges = [ (fromIntegral l, fromIntegral h, dbg)
-               | dbg <- dbgs, (l, h) <- dbgRanges dbg ]
+               | dbg <- dbgs, IPRange l h <- dbgRanges dbg ]
       low  (l,_,_) = l
       high (_,h,_) = h
       dbg  (_,_,d) = d
@@ -487,13 +685,13 @@ findLocalIPsamples :: Int -> EventsArray -> [(Timestamp, [Word64])]
 findLocalIPsamples startIx eventsArr =
   let getIPs CapEvent{{-ce_cap,-}ce_event=Event{time,spec=InstrPtrSample{..}}}
         = Just ({- ce_cap, -}time, ips)
---      getIPs CapEvent{{-ce_cap,-}ce_event=Event{time,spec=Blackhole{..}}} 
+--      getIPs CapEvent{{-ce_cap,-}ce_event=Event{time,spec=Blackhole{..}}}
 --        = Just (time, [ip])
       getIPs _other
         = Nothing
       count_f (_, ips) = length ips
       samples = findLocalEventsCount startIx ipSampleMaxCount eventsArr getIPs count_f
-  in traceShow (map (second length) samples) samples
+  in samples
 
 -- | Looks up a number of ranges, groups together same ranges
 lookupRanges :: RangeMap -> [Word64] -> [(Int, Maybe DebugEntry)]
@@ -528,13 +726,8 @@ findLocalIPsWeighted startIx eventsArr rangeMap =
 
 tagsFromLocalIPs2 :: Int -> EventsArray -> RangeMap -> [Tag]
 tagsFromLocalIPs2 startIx eventsArr rangeMap =
-  let toTag freq (Just dbg@DebugEntry{..})
-        = Tag { tagUnit = Just dbgUnit
-              , tagName = Just $ zdecode dbgLabel
-              , tagTick = dbgInstr
-              , tagDebug = Just dbg
-              , tagFreq = freq
-              }
+  let toTag freq (Just dbg)
+        = tagFromDebug freq dbg
       toTag freq Nothing
         = Tag { tagUnit = Nothing
               , tagName = Just "(unrecognized)"
@@ -550,6 +743,15 @@ tagsFromLocalIPs2 startIx eventsArr rangeMap =
       ord = compare `F.on` (fmap dbgId . tagDebug)
       t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }
   in nubSumBy ord plus tags
+
+tagFromDebug :: Double -> DebugEntry -> Tag
+tagFromDebug freq dbg@DebugEntry {..}
+  = Tag { tagUnit = Just dbgUnit
+        , tagName = Just $ zdecode dbgLabel
+        , tagTick = dbgInstr
+        , tagDebug = Just dbg
+        , tagFreq = freq
+        }
 
 zdecode :: String -> String
 zdecode ('z':'a':cs) = '&':zdecode cs
@@ -578,86 +780,40 @@ zdecode []           = []
 
 clearTextTags :: SourceBuffer -> IO ()
 clearTextTags sourceBuffer = do
-{-  tagListRef <- newIORef []
+  tagListRef <- newIORef []
   tagTable <- textBufferGetTagTable sourceBuffer
-  -- textTagTableForeach tagTable (textTagTableRemove tagTable)  
   textTagTableForeach tagTable (\t -> modifyIORef tagListRef (t:))
   tagList <- readIORef tagListRef
-  mapM_ (textTagTableRemove tagTable) tagList-}
+  --mapM_ (textTagTableRemove tagTable) tagList
   return ()
 
-showUnit :: SourceView -> String -> IO ()
-showUnit view@SourceView{..} unit = do
-  state <- readIORef stateRef
+{-  textTagTableForeach
+  tagTable <- textTagTableNew
+  set sourceBuffer [ textBufferTagTable := tagTable ]
+  return ()-}
+
+updateTextTags :: SourceView -> FileView -> IO ()
+updateTextTags SourceView{..} FileView{..}= do
+
+  -- Clear existing tags
   clearTextTags sourceBuffer
 
-  case state of
-    StateLoaded{..}
-      | Just file <- lookup unit unitMap ->
-        when (currentUnit /= Just unit) $ do
+  -- Annotate source code (all tags, then specificially the selection)
+  SourceViewState{tags,selection} <- readIORef stateRef
+  let annotate = annotateTags sourceFile sourceView sourceBuffer
+  annotate tags False
+  case selection of
+    Nothing  -> return ()
+    Just sel -> annotate [sel] True
 
-          -- Load the source file
-          modSrc <- readFile file
-          textBufferSetText sourceBuffer modSrc
-
-          -- Set state
-          writeIORef stateRef state{ currentUnit = Just unit }
-
-          -- Update tagging
-          updateTextTags view
-
-    -- We only have a symbol name and the file name to the binary?
-    -- That's expected for binaries without debug info. Explain this
-    -- to the user.
-    StateLoaded{selection} | Just Tag{tagName = Just n} <- selection
-                           , symTabPrefix `isPrefixOf` unit -> do
-      writeIORef stateRef state{ currentUnit = Nothing }
-      textBufferSetText sourceBuffer $
-        " *** Symbol from binary file ***\n\n" ++
-        "No source code info could be found...\n" ++
-        "This code was probably compiled without debugging annotations.\n\n" ++
-        "Binary: " ++ drop (length symTabPrefix) unit ++ "\n" ++
-        "Symbol: " ++ n
-
-    StateLoaded{} -> do
-      writeIORef stateRef state{ currentUnit = Nothing }
-      textBufferSetText sourceBuffer $
-        " *** Could not find source code for " ++ unit ++ "! ***"
-
-    StateEmpty -> do
-      writeIORef stateRef state{ currentUnit = Nothing }
-      textBufferSetText sourceBuffer ""
-
-updateTextTags :: SourceView -> IO ()
-updateTextTags SourceView{..} = do
-
-  state <- readIORef stateRef
-  case state of
-    StateLoaded{..} -> do
-
-        -- Clear existing tags
-        clearTextTags sourceBuffer
-
-        -- Annotate source code
-        let filterLocal = filter ((== currentUnit) . tagUnit)
-        annotateTags sourceView sourceBuffer (filterLocal tags) False
-        case selection of
-         Nothing  -> return ()
-         Just sel -> annotateTags sourceView sourceBuffer (filterLocal [sel]) True
-
-    _ -> return ()
-
-annotateTags :: GtkSourceView.SourceView -> SourceBuffer -> [Tag] -> Bool -> IO ()
-annotateTags sourceView sourceBuffer tags sel = do
+annotateTags :: String -> GtkSourceView.SourceView -> SourceBuffer -> [Tag] -> Bool -> IO ()
+annotateTags sourceFile sourceView sourceBuffer tags sel = do
   tagTable <- textBufferGetTagTable sourceBuffer
 
-  let freqMap2 = [(tagFreq, (1, srcs))
+  let freqMap2 = [(tagFreq, (1, src))
                  | Tag {tagFreq, tagDebug = Just dbg} <- tags
-                 , srcs <- extSources dbg ]
-      extSources DebugEntry { dbgSources, dbgDName = Nothing, dbgParent = Just p}
-        = dbgSources ++ extSources p
-      extSources DebugEntry { dbgSources}
-        = dbgSources
+                 , src <- extSources dbg
+                 , fileName src == sourceFile ]
       freqMap'  = nubSumBy (compare `F.on` snd) (\(f1, _) (f2, t) -> (f1+f2,t)) 
                   freqMap2
 
@@ -669,22 +825,20 @@ annotateTags sourceView sourceBuffer tags sel = do
                          textIterForwardChars iter c
                          return iter
 
-  forM_ freqMap' $ \(freq, (lvl, (sl, sc, el, ec, _))) -> when (sel || lvl == 1) $ do
+  forM_ freqMap' $ \(freq, (lvl, Span {..})) -> when (sel || lvl == 1) $ do
 
     -- Create color tag
     tag <- textTagNew Nothing
-    let w = min 230 $ max 0 $ 255 - round (100 * freq)
-        ws w | w < 16 = '0': showHex w ""
-             | True   = showHex w ""
+    let w = min 0xe000 $ max 0x0000 $ 0xffff - round (0x8000 * freq)
         --w' = 255 - round (fromIntegral 255 / fromIntegral (-lvl))
-        clr | sel  = "#8888ff"
-            | True = "#" ++ ws w ++ ws w ++ ws w
-    set tag [textTagBackground := clr, textTagBackgroundSet := True]
+        clr | sel       = Color 0x8888 0x8888 0xffff
+            | otherwise = Color w      w      w
+    set tag [textTagBackgroundGdk := clr, textTagBackgroundSet := True]
     tagTable `textTagTableAdd` tag
 
       -- Place at code position
-    start <- textBufferGetIterAtLineOffsetSafe (sl-1) (sc-1)
-    end <- textBufferGetIterAtLineOffsetSafe (el-1) ec
+    start <- textBufferGetIterAtLineOffsetSafe (startLine-1) (startCol-1)
+    end <- textBufferGetIterAtLineOffsetSafe (endLine-1) endCol
     textBufferApplyTag sourceBuffer tag start end
 
     --putStrLn $ "Annotating " ++ show (sl, sc, el, ec) ++ " with " ++ clr ++ "(lvl " ++ show lvl ++ ")"
@@ -692,31 +846,90 @@ annotateTags sourceView sourceBuffer tags sel = do
   -- Scroll to largest tick
   let ticks = map (snd . snd) freqMap'
   when (sel && not (null ticks)) $ do
-    let hpcSize (sl, sc, el, ec, _) = (el-sl, ec-sc)
+    let hpcSize (Span _ sl sc el ec) = (el-sl, ec-sc)
         largestTick = maximumBy (compare `F.on` hpcSize) ticks
-        (l, c, _, _, _) = largestTick
+        Span _ l c _ _ = largestTick
     iter <- textBufferGetIterAtLineOffset sourceBuffer (l-1) (c-1)
     _ <- textViewScrollToIter sourceView iter 0.2 Nothing
     return ()
 
 -------------------------------------------------------------------------------
 
-showCore :: SourceView -> IO ()
-showCore SourceView{..} = do
-  state <- readIORef stateRef
+coreMarkCatFolded, coreMarkCatOpen :: String
+coreMarkCatFolded = "threadscope-core-mark-folded"
+coreMarkCatOpen = "threadscope-core-mark-open"
 
-  case state of
-    StateLoaded{..}
-      | Just tag <- selection
-      , Just core <- fmap snd (findDbgElem dbgDCore (tagDebug tag)) -> do
+showCore :: SourceView -> Tag -> IO ()
+showCore view@SourceView{coreBuffer,stateRef} tag = do
 
-        clearTextTags sourceBuffer
-        textBufferSetText sourceBuffer (cleanupCore core)
+  -- Clear core buffer
+  begin <- textBufferGetStartIter coreBuffer
+  end <- textBufferGetEndIter coreBuffer
+  sourceBufferRemoveSourceMarks coreBuffer begin end coreMarkCatFolded
+  sourceBufferRemoveSourceMarks coreBuffer begin end coreMarkCatOpen
+  textBufferSetText coreBuffer ""
+  modifyIORef stateRef $ \s -> s { lineTags = [] }
 
-        writeIORef stateRef state { currentUnit = Nothing }
+  -- What to show?
+  let (unit, coreText)
+        | Just (_, core) <- findDbgElem dbgDCore $ tagDebug tag,
+          Just unit <- tagUnit tag
+        = (unit, prepareCore core)
+        | Just n <- tagName tag,
+          Just unit <- tagUnit tag,
+          symTabPrefix `isPrefixOf` unit
+        =  (unit,
+              "--               *** Symbol from binary file ***\n\n" ++
+              "-- No source code info could be found...\n" ++
+              "-- This code was probably compiled without debugging annotations.\n\n" ++
+              "-- Binary: " ++ drop (length symTabPrefix) unit ++ "\n" ++
+              "-- Symbol: " ++ n)
+        | otherwise
+        = ("", "No data available.")
 
-    _ -> return ()
+  -- Insert text
+  iter <- textBufferGetEndIter coreBuffer
+  showCorePlaceholders view iter unit coreText tag
 
+-- | Writes core to source view, inserting placeholders where core
+-- pieces have been left out.
+showCorePlaceholders :: SourceView -> TextIter -> String -> String -> Tag -> IO ()
+showCorePlaceholders SourceView{coreBuffer,stateRef} iter unit core tag = do
+
+  -- Get start line
+  startLine <- textIterGetLine iter
+
+  -- Split code up
+  let emitCore src = textBufferInsert coreBuffer iter src
+      emitIcon name = sourceBufferCreateSourceMark coreBuffer
+                      (Just $ show (unit, name) ) coreMarkCatFolded iter
+
+  let prefix = "\"__Core__"
+      go src []  = emitCore (reverse src)
+      go src rest
+        | prefix `isPrefixOf` rest
+          = do let r' = drop (length prefix) rest
+                   (name, r'') = break (== '\"') r'
+               emitCore (reverse src)
+               emitIcon name
+               go "" (drop 1 r'')
+      go src (r:rs)
+          = go (r:src) rs
+  go "" core
+
+  -- Get end line, set tags
+  endLine <- textIterGetLine iter
+  modifyIORef stateRef $ \s@SourceViewState{lineTags} ->
+    let (pr,su) = splitAt startLine lineTags
+    in s { lineTags = pr ++ replicate (endLine - startLine) tag ++ su }
+
+-- | Process core from its bytestring form into what we will actually
+-- be showing (cleared and all)
+prepareCore :: LBS.ByteString -> String
+prepareCore = cleanupCore . map (chr . fromIntegral) . LBS.unpack
+
+-- | Compresses core by merging lines with closing braces at the same
+-- indention level.
 cleanupCore :: String -> String
 cleanupCore = unlines . go . lines
   where
@@ -735,6 +948,65 @@ cleanupCore = unlines . go . lines
     trivialBlank (';':xs) = trivialBlank xs
     trivialBlank _        = False
 
+-- | Called when a mark gets activated.
+activateMark :: SourceView -> SourceBuffer -> TextIter -> IO ()
+activateMark sview@SourceView{stateRef} coreBuffer pos = do
+
+  -- Get our marks
+  line <- textIterGetLine pos
+  marks <- sourceBufferGetSourceMarksAtLine coreBuffer line coreMarkCatFolded
+
+  -- Loop through marks. We really only expect zero or one of them per line.
+  forM_ marks $ \mark -> do
+    name <- textMarkGetName mark
+    iter <- textBufferGetIterAtMark coreBuffer mark
+
+    -- Look up core
+    SourceViewState{coreMap,tags} <- readIORef stateRef
+    case fmap reads name of
+      Just [((unit, cname), "")]
+        | Just entry <- Map.lookup (unit, cname) coreMap,
+          Just (_, core) <- dbgDCore entry
+        -> do -- Replace mark
+              textBufferDeleteMark coreBuffer mark
+              sourceBufferCreateSourceMark coreBuffer Nothing coreMarkCatOpen iter
+              -- Get text to insert
+              offset <- textIterGetLineOffset iter
+              let tag = case find ((== Just entry) . tagDebug) tags of
+                    Just t  -> t
+                    Nothing -> tagFromDebug 0.0 entry
+                  coreText = prepareCore core
+                  indent = replicate offset ' '
+                  indentedText = unlines $ map (indent++) $ lines coreText
+              -- Insert text
+              showCorePlaceholders sview iter unit (indentedText ++ indent) tag
+              -- Save length to enable folding again?
+      _ -> return ()
+
+updateLineTags :: SourceView -> IO ()
+updateLineTags SourceView {stateRef, coreView} = do
+
+  -- Update tags
+  modifyIORef stateRef $ \s ->
+    let update t = case find (((==) `F.on` tagDebug) t) (tags s) of
+          Just t' -> t'
+          Nothing
+            | Just d <- tagDebug t -> tagFromDebug 0.0 d
+            | otherwise            -> t
+     in s { lineTags = map update $ lineTags s }
+
+  -- Redraw gutter
+  gutter <- sourceViewGetGutter coreView TextWindowLeft
+  sourceGutterQueueDraw gutter
+
+-------------------------------------------------------------------------------
+
+buildCoreMap :: [DebugEntry] -> CoreMap
+buildCoreMap = Map.fromList . mapMaybe coreData
+  where coreData entry@DebugEntry {dbgUnit, dbgDCore=Just (name, _)}
+          = Just ((dbgUnit, name), entry)
+        coreData _
+          = Nothing
 
 -------------------------------------------------------------------------------
 
@@ -754,6 +1026,11 @@ buildDbgMap :: EventsArray -> DbgMap
 buildDbgMap arr = dbgMap
   where
     (imap, dbgMap) = go "" 0 0 imap (IM.empty) (elems arr) []
+
+    -- The somewhat complicated knot tying here is a bit silly, given
+    -- that at some point we want to have unique instrumentation IDs
+    -- anyway. However, as currently the offset stuff doesn't seem to work,
+    -- we work around that by building one IntMap per module.
 
     go _     _     _ _     iMapO []     xs = (iMapO, xs)
     go mfile moff !i iMapI iMapO (e:es) xs = case spec $ ce_event e of
@@ -782,15 +1059,14 @@ buildDbgMap arr = dbgMap
       _other -> go mfile moff i iMapI iMapO es xs
 
     go_proc name srcs ranges core [] = (name, reverse srcs, ranges, core)
-    go_proc name srcs ranges core (e:es) = case spec $ ce_event e of
-      DebugSource { sline, scol, eline, ecol, file }
-        -> go_proc name ((fI sline, fI scol, fI eline, fI ecol, file):srcs) ranges core es
+    go_proc name srcs ranges core (e:es) = case spec (ce_event e) of
+      DebugSource { sline, scol, eline, ecol, file, name=name' }
+        -> let span = Span file (fI sline) (fI scol) (fI eline) (fI ecol)
+           in go_proc (name <|> Just name') (span:srcs) ranges core es
       DebugPtrRange { low, high }
-        -> go_proc name srcs ((fromIntegral low, fromIntegral high):ranges) core es
+        -> go_proc name srcs (IPRange (fromIntegral low) (fromIntegral high):ranges) core es
       DebugCore { coreBind, coreCode } | core == Nothing
         -> go_proc name srcs ranges (Just (coreBind, coreCode)) es
-      DebugName { dbgName } -- | name == Nothing
-        -> go_proc (Just dbgName) srcs ranges core es
       DebugProcedure {} -> stop
       CreateThread {} -> stop
       _other
@@ -811,6 +1087,13 @@ findWithDbgElem _ Nothing                           = Nothing
 findDbgElem :: (DebugEntry -> Maybe a) -> Maybe DebugEntry -> Maybe a
 findDbgElem f = (>>= f) . findWithDbgElem f
 
+-- | Returns source code annotations to show for the given debug entry
+extSources :: DebugEntry -> [Span]
+extSources DebugEntry { dbgSources, dbgDName = Nothing, dbgParent = Just p}
+  = dbgSources ++ extSources p
+extSources DebugEntry { dbgSources}
+  = dbgSources
+
 ------------------------------------------------------------------------------
 
 -- | Subsume tags for the viewed list
@@ -820,5 +1103,5 @@ subsumeTags = nubSumBy cmp plus
          dbgCmpId dbg = case findWithDbgElem dbgDCore dbg of
            Just DebugEntry { dbgDCore = Just (n, _) }
                        -> Left n
-           Nothing     -> Right (fmap dbgId dbg)
+           _           -> Right (fmap dbgId dbg)
          t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }

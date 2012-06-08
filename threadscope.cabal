@@ -20,8 +20,8 @@ Executable threadscope
   Build-Depends:     base >= 4.0 && < 5, 
                      gtk >= 0.11, cairo, glib, pango, gtksourceview2, transformers,
                      binary, array, mtl, filepath,
-                     ghc-events >= 0.2,
-                     containers >= 0.2 && < 0.5,
+                     ghc-events == 0.3.*,
+                     containers >= 0.2 && < 0.5, pretty,
                      directory, deepseq, bytestring
   extensions:        RecordWildCards, NamedFieldPuns,
                      BangPatterns, PatternGuards,
@@ -31,6 +31,7 @@ Executable threadscope
                      Events.EventTree, 
                      Events.ReadEvents,
                      Events.TestEvents,
+                     Events.Core,
                      GUI.Main,
                      GUI.MainWindow,
                      GUI.EventsView,

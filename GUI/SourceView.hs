@@ -521,6 +521,7 @@ fileViewNew sview@SourceView {stateRef,haskellLang,sourceFont,sourceBook} source
 
   -- Create scrolled window to allow scrolling in view
   sourceScroll <- scrolledWindowNew Nothing Nothing
+  scrolledWindowSetPolicy sourceScroll PolicyAutomatic PolicyAlways
   containerAdd sourceScroll sourceView
 
 {--
@@ -831,6 +832,7 @@ sourceViewSetCursor view@SourceView {..} n = do
     updateLineTags view
     setTagSelection view selection'
     setSrcTagSelection view srcSel'
+    updateStructPixbufMap view
 
 -- | If the debug entry has no source annotations at all, we assume
 -- that the source code annotations of the paraent context are
@@ -960,27 +962,28 @@ updateSrcTagSelection view@SourceView{..} = do
       let span = stagSource stag
           buf = sourceBuffer fileView
       textIter <- textBufferGetIterAtLineOffsetSafe buf
-                    (startLine span) (startCol span)
+                  (startLine span) (startCol span)
       let markName = "threadscope-scroll-mark"
       m_scrollMark <- textBufferGetMark buf markName
       scrollMark <- case m_scrollMark of
         Just mark -> do textBufferMoveMark buf mark textIter
                         return mark
         Nothing   -> textBufferCreateMark buf (Just markName) textIter True
-      textViewScrollToMark (sourceView fileView) scrollMark 0 (Just (0.5,0.5))
+      postGUIAsync $
+        textViewScrollToMark (sourceView fileView) scrollMark 0 (Just (0.5,0.5))
 
       -- Update labels
       updateFileBookLabels view
 
       -- Subsume tags
-      let tags = subsumeTags $ map tagEntry $ stagTags stag
+      let tags = subsumeTags $ stagTags stag
 
       -- Show cores
       clearCore view
-      forM_ (sortBy (compare `F.on` tagFreq) tags) $ \tag -> do
+      forM_ (reverse $ sortBy (compare `F.on` tagFreq) tags) $ \tag -> do
         iter <- textBufferGetEndIter coreBuffer
         writeSource view iter [] $ "---- " ++ fromMaybe "???" (tagName tag) ++ " ----\n"
-        showCore view (tagEntry tag)
+        showCore view tag
         iter <- textBufferGetEndIter coreBuffer
         writeSource view iter [] "\n"
 
@@ -1521,124 +1524,26 @@ printCore sview@SourceView{coreBuffer} iter unit ltags core = do
     (return ())
     core
 
-{--
-
--- | Writes core to source view, inserting placeholders where core
--- pieces have been left out.
-showCorePlaceholders :: SourceView -> TextIter -> String -> Maybe DebugEntry -> String -> IO ()
-showCorePlaceholders sview@SourceView{coreBuffer,stateRef} iter unit dbg core = do
-
-  -- Find a good indention level
-  lineOff <- textIterGetLineOffset iter
-  iter2 <- textIterCopy iter
-  textIterBackwardChars iter2 lineOff
-  textIterForwardWordEnd iter2
-  textIterBackwardWordStart iter2
-
-  -- Get our indention level
-  indent <- (+2) <$> textIterGetLineOffset iter2
-  let indentStr = replicate indent ' '
-
-  -- How to write folded code. Emit open or closed depending on
-  -- whether we subsume it by default.
-  --
-  -- Note: This is getting even stranger by the minute. Needs a rewrite.
-  SourceViewState{coreMap} <- readIORef stateRef
-  let emitFold bind cons
-        | Just entries <- Map.lookup (unit, bind, cons) coreMap,
-          Just d <- fmap getSubsumationEntry dbg,
-          all ((== d) . getSubsumationEntry) entries
-        = forM_ entries $ \e -> case dbgDCore e of
-            Just core -> do
-              sourceBufferCreateSourceMark coreBuffer
-                (Just $ markName bind cons) coreMarkCatOpen iter
-              showCorePlaceholders sview iter unit (Just e)
-                (prepareCore cons $ dbgCoreCode core)
-              sourceBufferCreateSourceMark coreBuffer
-                (Just $ markNameEnd bind cons) coreMarkCatOpenEnd iter
-              return ()
-            Nothing ->
-              return ()
-        | otherwise
-        = do sourceBufferCreateSourceMark coreBuffer
-               (Just $ markName bind cons) coreMarkCatFolded iter
-             return ()
-      markName bind cons = show (unit, bind, cons)
-      markNameEnd bind cons = markName bind cons ++ "_end"
-
-  -- Split up source code
-  let corePrefix = "\"__Core__"
-      defAlt = "__DEFAULT ->"
-      go src _    []
-        = writeCore sview iter dbg (reverse src)
-      go src csrc ('\n':rs)
-        = go (indentStr++'\n':src) csrc rs
-
-      -- Finding "__DEFAULT ->" causes us to assume that we are in a
-      -- case, which might have an Core link in it. As the actual link
-      -- can come after arbitrary whitespace (or not at all), we just
-      -- save back the source at this position so we can later decide
-      -- what to do.
-      go src _    rest
-        | defAlt `isPrefixOf` rest
-        = go (reverse defAlt ++ src) (Just src) (drop (length defAlt) rest)
-
-      go src csrc rest
-        | corePrefix `isPrefixOf` rest
-          = do let r' = drop (length corePrefix) rest
-                   (name, r'') = break (== '\"') r'
-               writeCore sview iter dbg $ case csrc of
-                 Just s  -> reverse s
-                 Nothing -> reverse src
-               emitFold name "" -- FIXME
-               go "" Nothing (dropWhile isSpace $ drop 1 r'')
-
-      -- Stop passing through "case" source pointe on non-whitespace
-      go src csrc (r:rs)
-          = go (r:src) (if isSpace r then csrc else Nothing) rs
-
-  go "" Nothing core
-
--- | Process core from its bytestring form into what we will actually
--- be showing (cleared and all)
-prepareCore :: String -> CoreExpr -> String
-prepareCore _cons = show --cleanupCore calt . map (chr . fromIntegral) . LBS.unpack
-
--- | Compresses core by merging lines with closing braces at the same
--- indention level.
-cleanupCore :: Bool -> String -> String
-cleanupCore calt
-  | calt      = unlines . go . ("":) . lines
-  | otherwise = unlines . go . lines
-  where
-    go (l1:l2:ls) | trivialBlank l1
-                  , trivialBlank l2
-                  , takeWhile isSpace l1 == takeWhile isSpace l2
-                  , length l1 < 80
-      = go ((l1 ++ " " ++ dropWhile isSpace l2):ls)
-    go (l:ls) = l:go ls
-    go []     = []
-
-    trivialBlank ""       = True
-    trivialBlank (' ':xs) = trivialBlank xs
-    trivialBlank ('}':xs) = trivialBlank xs
-    trivialBlank (')':xs) = trivialBlank xs
-    trivialBlank (';':xs) = trivialBlank xs
-    trivialBlank _        = False
-
---}
-
 -- | Called when a mark gets activated.
 activateMark :: SourceView -> SourceBuffer -> TextIter -> IO ()
 activateMark sview@SourceView{stateRef} coreBuffer pos = do
 
-  return ()
-  
-  {--
   -- Get our marks
   line <- textIterGetLine pos
   foldedMarks <- sourceBufferGetSourceMarksAtLine coreBuffer line coreMarkCatFolded
   openMarks <- sourceBufferGetSourceMarksAtLine coreBuffer line coreMarkCatOpen
+
+  -- Lookup tags at position
+  SourceViewState{lineTags=ltagss} <- readIORef stateRef
+  let ltags = case drop line ltagss of
+        (ltags:_) -> ltags
+        _         -> []
+
+  -- Parse data out of name
+  let decomposeName name = case break (== '(') name of
+        (mtype, mname) | [(ref, "")] <- reads mname
+                         -> Just ref
+        _                -> Nothing
 
   -- Loop through folded marks. We really only expect zero or one of them per line.
   forM_ foldedMarks $ \mark -> do
@@ -1647,21 +1552,16 @@ activateMark sview@SourceView{stateRef} coreBuffer pos = do
 
     -- Look up core
     SourceViewState{coreMap} <- readIORef stateRef
-    case fmap (break (== '(')) name of
-      Just (mtype, mname)
-        | [((unit, cname, cons), "")] <- reads mname
-        , Just entries <- Map.lookup (unit, cname, cons) coreMap
-        -> forM_ entries $ \entry -> do
-          -- Replace mark
-          let core = dbgCoreCode $ fromJust $ dbgDCore entry
-          textBufferDeleteMark coreBuffer mark
-          sourceBufferCreateSourceMark coreBuffer name coreMarkCatOpen iter
-          -- Get text to insert
-          let coreText = prepareCore cons core
-          -- Insert text
-          showCorePlaceholders sview iter unit (Just entry) coreText
-          sourceBufferCreateSourceMark coreBuffer (fmap (++"_end") name) coreMarkCatOpenEnd iter
-          return ()
+    case name >>= decomposeName of
+      Just (unit, cname, cons) | Just entry <- Map.lookup (unit, cname, cons) coreMap
+        -> do -- Replace mark
+              let Just core = fmap dbgCoreCode $ dbgDCore entry
+              textBufferDeleteMark coreBuffer mark
+              writeOpenMarkStart sview iter unit (cname, cons)
+              -- Insert text
+              printCore sview iter unit ltags core
+              writeOpenMarkEnd sview iter unit (cname, cons)
+              return ()
       _ -> return ()
 
   -- Loop through open marks. Same as above.
@@ -1670,26 +1570,35 @@ activateMark sview@SourceView{stateRef} coreBuffer pos = do
     iter <- textBufferGetIterAtMark coreBuffer mark
 
     -- Find end mark
-    m_markEnd <- case name of
-      Just n  -> textBufferGetMark coreBuffer (n++"_end")
-      Nothing -> return Nothing
-    case m_markEnd of
+    case name >>= decomposeName of
       Nothing -> return ()
-      Just markEnd -> do
-        -- Get iterator for end
-        iterEnd <- textBufferGetIterAtMark coreBuffer markEnd
-        -- Find out how many lines we span
-        lineEnd <- textIterGetLine iterEnd
-        -- Remove text
-        clearCore coreBuffer iter iterEnd
-        -- Insert closed mark
-        sourceBufferCreateSourceMark coreBuffer name coreMarkCatFolded iter
-        -- Remove line annotations
-        modifyIORef stateRef $ \s ->
-          s { lineTags = let (pr, re) = splitAt line (lineTags s)
-                         in pr ++ drop (lineEnd - line) re
-            }
---}
+      Just (unit, cname, cons) -> do
+        m_markEnd <- textBufferGetMark coreBuffer (markNameEnd unit (cname, cons))
+        case m_markEnd of
+          Nothing -> return ()
+          Just markEnd -> do
+            -- Get iterator for end
+            iterEnd <- textBufferGetIterAtMark coreBuffer markEnd
+            -- Get text, decide what prefix to keep: Indention at minimum
+            slice <- textIterGetSlice iter iterEnd
+            let pre = case span isSpace slice of
+                  (ind, _)
+                      -> length ind
+            textIterForwardChars iter pre
+            -- Remove old marks, insert closed mark
+            textBufferDeleteMark coreBuffer mark
+            textBufferDeleteMark coreBuffer markEnd
+            -- Find out how many lines we span
+            lineEnd <- textIterGetLine iterEnd
+            -- Remove marks and text
+            deleteCore coreBuffer iter iterEnd
+            writeFoldedMark sview iter unit (cname, cons)
+            -- Remove line annotations
+            modifyIORef stateRef $ \s ->
+              s { lineTags = let (pr, re) = splitAt line (lineTags s)
+                             in pr ++ drop (lineEnd - line) re
+                }
+
 updateLineTags :: SourceView -> IO ()
 updateLineTags SourceView {stateRef, coreView} = do
 
@@ -1818,18 +1727,17 @@ extSources DebugEntry { dbgSources}
 
 -- | Subsume tags for the viewed list
 subsumeTags :: [Tag] -> [Tag]
-subsumeTags = nubSumBy cmp plus
-   where cmp = compare `F.on` (fmap dbgCmpId . tagDebug)
-         dbgCmpId dbg = dbgId $ getSubsumationEntry dbg
-         t1 `plus` t2 = let ss = fmap getSubsumationEntry $ tagDebug t1 in
+subsumeTags = nubSumBy cmp plus . map subsume
+   where cmp = compare `F.on` (fmap dbgId . tagDebug)
+         t1 `plus` t2 =
            t1 {
              tagEntry = case () of
-                _ | tagDebug t1 == ss  -> t1
-                  | tagDebug t2 == ss  -> t2
-                  | otherwise          -> t2,
-             tagDebug = ss,
+                _ | tagDebug t1 == tagDebug (tagEntry t1)  -> t1
+                  | tagDebug t2 == tagDebug (tagEntry t2)  -> t2
+                  | otherwise                              -> t2,
              tagFreq = tagFreq t1 + tagFreq t2
            }
+         subsume t = t { tagDebug = fmap getSubsumationEntry $ tagDebug t }
 
 -- | Finds debug entry
 getSubsumationEntry :: DebugEntry -> DebugEntry

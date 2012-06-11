@@ -60,7 +60,8 @@ data FileView = FileView {
   sourceView     :: GtkSourceView.SourceView,
   sourceBuffer   :: SourceBuffer,
   sourceScroll   :: ScrolledWindow,
-  sourceOverview :: DrawingArea
+  sourceOverview :: DrawingArea,
+  sourceTextTags :: IORef [TextTag]
   }
 
 data SourceView = SourceView {
@@ -73,8 +74,8 @@ data SourceView = SourceView {
   tagsTreeView :: TreeView,
   tagsStore    :: ListStore Tag,
   srcTagsTreeView :: TreeView,
-  srcTagsStore :: TreeStore SourceTag,
-  structRenderer :: CellRendererPixbuf,
+  srcTagsStore    :: TreeStore SourceTag,
+  structRenderer  :: CellRendererPixbuf,
 
   textHeight   :: !Int
   }
@@ -250,6 +251,12 @@ sourceViewNew builder SourceViewActions{..} = do
     Nothing      -> sourceBufferNew Nothing
   textViewSetBuffer coreView coreBuffer
 
+  -- Set "Core" label as bold
+  coreLabel <- getWidget castToLabel "core_label"
+  boldFont <- fontDescriptionNew
+  fontDescriptionSetWeight boldFont WeightBold
+  widgetModifyFont coreLabel $ Just boldFont
+
   -- Lookup mark icons
   sourceViewSetMarkCategoryIconFromStock coreView coreMarkCatFolded (Just stockAdd)
   sourceViewSetMarkCategoryIconFromStock coreView coreMarkCatOpen (Just stockRemove)
@@ -257,6 +264,10 @@ sourceViewNew builder SourceViewActions{..} = do
 
   -- Find some layout parameters
   (wdt, textHeight) <- getTextDimensions coreView "100.0%"
+
+  -- Find style data
+  style <- widgetGetStyle coreView
+  bgColor <- styleGetBackground style StateNormal
 
   -- Set up cost annotations for core view
   costRenderer <- cellRendererTextNew
@@ -271,6 +282,9 @@ sourceViewNew builder SourceViewActions{..} = do
   -- Set up cost structure annotations for core view
   structRenderer <- cellRendererPixbufNew
   sourceGutterInsert coreGutter structRenderer (-10)
+
+  -- Initialize state
+  stateRef <- newIORef initViewState
 
   -- Create columns for tag list
   tagsTreeView <- getWidget castToTreeView "source_tagstree"
@@ -301,12 +315,11 @@ sourceViewNew builder SourceViewActions{..} = do
   cellLayoutSetAttributes tagCoreCol tagCoreRender tagsStore $ \Tag{..} ->
     [ cellText := fromMaybe "" (dbgCoreBind <$> findDbgElem dbgDCore tagDebug) ]
   cellLayoutSetAttributes tagModCol tagModRender tagsStore $ \Tag{..} ->
-    [ cellText :=
-      let -- If the compilation unit is "SYMTAB", this is a pseudo
-          -- module inserted by GHC for procedure ranges it found but
-          -- couldn't map to a piece of Haskell code. We show the name
-          -- of the binary the symbol came from in that case.
-      in case fmap dbgUnit tagDebug of
+    [ -- If the compilation unit is "SYMTAB", this is a pseudo
+      -- module inserted by GHC for procedure ranges it found but
+      -- couldn't map to a piece of Haskell code. We show the name
+      -- of the binary the symbol came from in that case.
+      cellText := case fmap dbgUnit tagDebug of
             Just m | symTabPrefix `isPrefixOf` m
                      -> "(" ++ takeFileName (drop (length symTabPrefix) m) ++ ")"
                    | otherwise
@@ -333,19 +346,42 @@ sourceViewNew builder SourceViewActions{..} = do
   srcTagNameRender <- cellRendererTextNew
   srcTagNameCol    <- mkColumn srcTagsTreeView srcTagNameRender "Name"
 
+
+-- updateSourceTagsActivation :: TreeStore (SourceTag, Bool) -> SourceTag -> IO ()
+-- updateSourceTagsActivation tagsStore tag = do
+--   treeModelForeach tagsStore $ \i -> do
+--     p <- treeModelGetPath tagsStore i
+--     treeStoreChange tagsStore p $ \(t, _) ->
+--       (t, any (`elem` stagTags tag) $ stagTags t)
+
   -- Set column content
   treeViewSetModel srcTagsTreeView srcTagsStore
-  cellLayoutSetAttributes srcTagFreqCol srcTagFreqRender srcTagsStore $ \SourceTag{..} ->
-    [ cellProgressText := Just $ printf "%02.1f" (stagFreq * 100)
-    , cellProgressValue := round (stagFreq * 100) ]
-  cellLayoutSetAttributes srcTagNameCol srcTagNameRender srcTagsStore $ \SourceTag{..} ->
-    [ cellText := takeFileName (spanName stagSource) ]
+  let checkActive tag = do
+        SourceViewState{srcSel} <- readIORef stateRef
+        return $ case srcSel of
+          Just stag -> any (`elem` stagTags stag) $ stagTags tag
+          Nothing   -> False
+  cellLayoutSetAttributeFunc srcTagFreqCol srcTagFreqRender srcTagsStore $ \iter -> do
+    tag <- treeModelGetRow srcTagsStore iter
+    active <- checkActive tag
+    set srcTagFreqRender
+      [ cellProgressText := Just $ printf "%02.1f" (stagFreq tag * 100)
+      , cellProgressValue := round (stagFreq tag * 100)
+      , cellBackgroundColor := bgColor
+      , cellBackgroundSet := active ]
+  cellLayoutSetAttributeFunc srcTagNameCol srcTagNameRender srcTagsStore $ \iter -> do
+    tag <- treeModelGetRow srcTagsStore iter
+    active <- checkActive tag
+    set srcTagNameRender
+      [ cellText := spanName $ stagSource tag
+      , cellBackgroundColor := bgColor
+      , cellBackgroundSet := active ]
+    return ()
 
   -- Set up search column
-  treeViewSetSearchColumn srcTagsTreeView srcTagNameCol
+  treeViewSetSearchColumn srcTagsTreeView (makeColumnIdString 1)
   treeViewSetEnableSearch srcTagsTreeView True
 
-  stateRef <- newIORef initViewState
   let srcView    = SourceView {..}
 
   -- Register events
@@ -487,6 +523,7 @@ fileViewNew sview@SourceView {stateRef,haskellLang,sourceFont,sourceBook} source
   sourceScroll <- scrolledWindowNew Nothing Nothing
   containerAdd sourceScroll sourceView
 
+{--
   -- Create overview drawing area
   sourceOverview <- drawingAreaNew
   widgetSetSizeRequest sourceOverview 20 20
@@ -495,26 +532,44 @@ fileViewNew sview@SourceView {stateRef,haskellLang,sourceFont,sourceBook} source
   hBox <- hBoxNew False 1
   boxPackStart hBox sourceScroll PackGrow 0
   boxPackEnd hBox sourceOverview PackNatural 0
+--}
+
+  let hBox = sourceScroll
+      sourceOverview = undefined
+
+  -- Create label with full path
+  sourceLabel <- labelNew (Just sourceFile)
+  miscSetAlignment sourceLabel 0 0
+  boldFont <- fontDescriptionNew
+  fontDescriptionSetWeight boldFont WeightBold
+  widgetModifyFont sourceLabel $ Just boldFont
+
+  -- Add above source scroll
+  vBox <- vBoxNew False 1
+  boxPackStart vBox sourceLabel PackNatural 0
+  boxPackEnd vBox hBox PackGrow 0
 
   -- Create notebook page for the file
-  sourcePage <- notebookAppendPage sourceBook hBox $ takeFileName sourceFile
+  sourcePage <- notebookAppendPage sourceBook vBox $ takeFileName sourceFile
 
   -- We don't actually load any content yet
   sourceLoad <- newIORef False
+  sourceTextTags <- newIORef []
 
   -- Add to file view list
   let fileView = FileView {..}
   modifyIORef stateRef $ \state ->
     state { files = files state ++ [fileView] }
 
+{--
   -- Register for drawing overview
   on sourceOverview exposeEvent $ do
     region <- eventRegion
     liftIO (drawFileOverview sview fileView region)
     return True
-
+--}
   -- Show everything
-  widgetShowAll hBox
+  widgetShowAll vBox
 
   return fileView
 
@@ -744,14 +799,7 @@ sourceViewSetCursor view@SourceView {..} n = do
   let selection' = selection >>= (\t -> find (== t) tags')
 
   -- Build source tag list
-  let getSources tag = map (mkSourceTag tag) $ findSources $ tagDebug tag
-      -- If the debug entry has no source annotations at all, we
-      -- assume that the source code annotations of the paraent
-      -- context are most relevant (if any).
-      findSources Nothing       = []
-      findSources (Just DebugEntry{dbgSources, dbgParent})
-        | not (null dbgSources) = dbgSources
-        | otherwise             = findSources dbgParent
+  let getSources tag = map (mkSourceTag tag) $ findDebugSources $ tagDebug tag
       mkSourceTag tag src = SourceTag { stagSource = src
                                       , stagTags = [tag]
                                       , stagFreq = tagFreq tag }
@@ -783,6 +831,16 @@ sourceViewSetCursor view@SourceView {..} n = do
     updateLineTags view
     setTagSelection view selection'
     setSrcTagSelection view srcSel'
+
+-- | If the debug entry has no source annotations at all, we assume
+-- that the source code annotations of the paraent context are
+-- most relevant (if any).
+findDebugSources :: Maybe DebugEntry -> [Span]
+findDebugSources Nothing       = []
+findDebugSources (Just DebugEntry{dbgSources, dbgParent})
+  | not (null dbgSources) = dbgSources
+  | otherwise             = findDebugSources dbgParent
+
 
 updateTagsView :: ListStore Tag -> [Tag] -> IO ()
 updateTagsView tagsStore tags = do
@@ -893,9 +951,9 @@ updateSrcTagSelection view@SourceView{..} = do
       let unit = fileName $ stagSource stag
       fileView <- fileViewGet view unit
       notebookSetCurrentPage sourceBook (sourcePage fileView)
+      updateTextTags view fileView
 
       -- Scroll to function
-
       -- Note: We are creating a mark here, as scrolling to an
       -- iterator position is not reiable with freshly opened text
       -- buffers.
@@ -925,6 +983,10 @@ updateSrcTagSelection view@SourceView{..} = do
         showCore view (tagEntry tag)
         iter <- textBufferGetEndIter coreBuffer
         writeSource view iter [] "\n"
+
+      -- update activation due to new selection
+      widgetQueueDraw srcTagsTreeView
+
 
     Nothing ->
       return ()
@@ -1214,14 +1276,12 @@ zdecode []           = []
 
 -------------------------------------------------------------------------------
 
-clearTextTags :: SourceBuffer -> IO ()
-clearTextTags sourceBuffer = do
-  tagListRef <- newIORef []
+clearTextTags :: FileView -> IO ()
+clearTextTags FileView{sourceBuffer, sourceTextTags} = do
+  tagList <- readIORef sourceTextTags
   tagTable <- textBufferGetTagTable sourceBuffer
-  textTagTableForeach tagTable (\t -> modifyIORef tagListRef (t:))
-  --tagList <- readIORef tagListRef
-  --mapM_ (textTagTableRemove tagTable) tagList
-  return ()
+  mapM_ (textTagTableRemove tagTable) tagList
+  writeIORef sourceTextTags []
 
 {-  textTagTableForeach
   tagTable <- textTagTableNew
@@ -1229,18 +1289,19 @@ clearTextTags sourceBuffer = do
   return ()-}
 
 updateTextTags :: SourceView -> FileView -> IO ()
-updateTextTags SourceView{..} FileView{..}= do
+updateTextTags SourceView{..} fw@FileView{..}= do
 
   -- Clear existing tags
-  clearTextTags sourceBuffer
+  clearTextTags fw
 
   -- Annotate source code (all tags, then specificially the selection)
-  SourceViewState{tags,selection} <- readIORef stateRef
-  let annotate = annotateTags sourceFile sourceView sourceBuffer
-  annotate tags False
-  case selection of
+  SourceViewState{tags,srcSel} <- readIORef stateRef
+  let annotate = annotateTags sourceFile sourceView sourceBuffer sourceTextTags
+  case srcSel of
     Nothing  -> return ()
-    Just sel -> annotate [sel] True
+    Just sel -> do
+      annotate (concatMap (findDebugSources . tagDebug) $ stagTags sel) False
+      annotate [stagSource sel] True
 
 -- | From a list of tags, gives the source ranges that are covered by
 -- the tags in the given file.
@@ -1263,21 +1324,24 @@ textBufferGetIterAtLineOffsetSafe buf l c = do
             textIterForwardChars iter c
             return iter
 
-annotateTags :: String -> GtkSourceView.SourceView -> SourceBuffer -> [Tag] -> Bool -> IO ()
-annotateTags sourceFile sourceView sourceBuffer tags sel = do
+annotateTags :: String -> GtkSourceView.SourceView -> SourceBuffer -> IORef [TextTag] -> [Span] -> Bool -> IO ()
+annotateTags sourceFile sourceView sourceBuffer sourceTextTags spans sel = do
   tagTable <- textBufferGetTagTable sourceBuffer
 
+  -- Find colors
+  style <- widgetGetStyle sourceView
+  bgColor <- styleGetBackground style $
+             if sel then StateSelected else StateNormal
+
+  -- Filter spans by file
+  let spans' = filter ((== sourceFile) . fileName) spans
+
   -- Get spans to annotate
-  let freqMap' = getFileSourceSpans sourceFile tags
-  forM_ freqMap' $ \(freq, Span {..}) -> do
+  ttags <- forM spans' $ \Span {..} -> do
 
     -- Create color tag
     tag <- textTagNew Nothing
-    let w = min 0xe000 $ max 0x0000 $ 0xffff - round (0x8000 * freq)
-        --w' = 255 - round (fromIntegral 255 / fromIntegral (-lvl))
-        clr | sel       = Color 0x8888 0x8888 0xffff
-            | otherwise = Color w      w      w
-    set tag [textTagBackgroundGdk := clr, textTagBackgroundSet := True]
+    set tag [textTagBackgroundGdk := bgColor, textTagBackgroundSet := True]
     tagTable `textTagTableAdd` tag
 
       -- Place at code position
@@ -1287,16 +1351,10 @@ annotateTags sourceFile sourceView sourceBuffer tags sel = do
 
     --putStrLn $ "Annotating " ++ show (sl, sc, el, ec) ++ " with " ++ clr ++ "(lvl " ++ show lvl ++ ")"
 
-  -- Scroll to largest tick
-  let ticks = map snd freqMap'
-  when (sel && not (null ticks)) $ do
-    let hpcSize (Span _ _ sl sc el ec) = (el-sl, ec-sc)
-        largestTick = maximumBy (compare `F.on` hpcSize) ticks
-        (Span _ _ l c _ _) = largestTick
-    iter <- textBufferGetIterAtLineOffset sourceBuffer (l-1) (c-1)
-    postGUIAsync $ do textViewScrollToIter sourceView iter 0.2 Nothing
-                      return ()
-    return ()
+    return tag
+
+  -- Save back text tags
+  modifyIORef sourceTextTags (++ ttags)
 
 -------------------------------------------------------------------------------
 
@@ -1815,7 +1873,7 @@ subsumeSrcTags filesOnly = nubSumBy (cmpSpan `F.on` stagSource) plus
           | otherwise = (spanName s1, fileName s1) `compare` (spanName s2, fileName s2)
         plusSpan s1 s2 =
           let (sl, sc) = min (startLine s1, startCol s1) (startLine s2, startCol s2)
-              (el, ec) = min (endLine s1, endCol s1) (endLine s2, endCol s2)
+              (el, ec) = max (endLine s1, endCol s1) (endLine s2, endCol s2)
           in s1 { startLine = sl, startCol = sc, endLine = el, endCol = ec }
         plus st1 st2 = let tags' = nub (stagTags st1 ++ stagTags st2) in
           st1 { stagSource = plusSpan (stagSource st1) (stagSource st2)

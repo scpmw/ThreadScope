@@ -35,6 +35,7 @@ import qualified Data.Set as Set
 import Data.Char (isSpace)
 import qualified Data.ByteString as BS
 import Data.Tree (Tree(Node))
+import Data.Ord (comparing)
 
 import System.FilePath
 import System.Directory (doesFileExist,getCurrentDirectory,canonicalizePath)
@@ -161,7 +162,9 @@ data Tag = Tag {
   }
 
 data SourceTag = SourceTag {
-  stagSource :: Span,
+  stagFile :: String,
+  stagName :: String,
+  stagSources :: [Span],
   stagTags :: [Tag],
   stagFreq :: !Double
   }
@@ -211,8 +214,8 @@ dumpDebug DebugEntry{..} = do
     (maybe "no dbg name" ("dbg name " ++) dbgDName) ++ ", " ++
     (maybe "no instr" (("instr " ++) . show) dbgInstr) ++ ", " ++
     (maybe "no parent" (\DebugEntry{..} -> "parent " ++ dbgUnit ++ "/" ++ dbgLabel) dbgParent) ++ ", " ++
-    show (length dbgSources) ++ " source ranges, " {- ++
-    (maybe "no core" (("core " ++) . show . dbgCoreCode) dbgDCore) -}
+    show (length dbgSources) ++ " source ranges, " ++
+    (maybe "no core" (("core " ++) . show . dbgCoreCode) dbgDCore)
 
 dumpTag :: Tag -> IO ()
 dumpTag tag = do
@@ -373,7 +376,7 @@ sourceViewNew builder SourceViewActions{..} = do
     tag <- treeModelGetRow srcTagsStore iter
     active <- checkActive tag
     set srcTagNameRender
-      [ cellText := spanName $ stagSource tag
+      [ cellText := stagName tag
       , cellBackgroundColor := bgColor
       , cellBackgroundSet := active ]
     return ()
@@ -800,23 +803,33 @@ sourceViewSetCursor view@SourceView {..} n = do
   let selection' = selection >>= (\t -> find (== t) tags')
 
   -- Build source tag list
-  let getSources tag = map (mkSourceTag tag) $ findDebugSources $ tagDebug tag
-      mkSourceTag tag src = SourceTag { stagSource = src
+  let getSources tag =
+        case map (mkSourceTag tag) $ findDebugSources $ tagDebug tag of
+          [] -> [mkNoSourceTag tag]
+          xs -> xs
+      mkSourceTag tag src = SourceTag { stagFile = fileName src
+                                      , stagName = spanName src
+                                      , stagSources = [src]
                                       , stagTags = [tag]
                                       , stagFreq = tagFreq tag }
+      mkNoSourceTag tag = SourceTag { stagFile = "(no haskell)"
+                                    , stagName = maybe "?" (\x -> "("++x++")") $ tagName tag
+                                    , stagSources = []
+                                    , stagTags = [tag]
+                                    , stagFreq = tagFreq tag }
       sourceTags' = sortBy (compare `F.on` stagFreq) $
                     subsumeSrcTags False $ concatMap getSources tags'
       fileTags' = sortBy (compare `F.on` stagFreq) $
                   map mkFileSrcTag $
                   subsumeSrcTags True $ concatMap getSources tags'
-      mkFileSrcTag s@SourceTag{stagSource=st@Span{fileName}}
-        = s { stagSource = st { spanName = takeFileName fileName }}
+      mkFileSrcTag s
+        = s { stagName = stagFile s }
 
   -- Update source tag selection
   let srcSel' = srcSel >>= (\s -> find (sourceTagEquiv s) sourceTags')
 
   forM_ sourceTags' $ \SourceTag{..} -> do
-    putStrLn $ printf "** %02.2f %s:%s" (100 * stagFreq) (fileName stagSource) (spanName stagSource)
+    putStrLn $ printf "** %02.2f %s:%s" (100 * stagFreq) stagFile stagName
     mapM_ dumpTag stagTags
 
   -- Set new state
@@ -857,10 +870,10 @@ updateSourceTagsView tagsStore tags fileTags = do
   -- Construct tree
   let unitTree x = Node x []
       stagForest file
-        = map unitTree $ reverse $ filter ((== file) . fileName . stagSource) tags
+        = map unitTree $ reverse $ filter ((== file) . stagFile) tags
   treeStoreClear tagsStore
   treeStoreInsertForest tagsStore [] 0 $ reverse
-    [ Node st (stagForest $ fileName $ stagSource st) | st <- fileTags ]
+    [ Node st (stagForest $ stagFile st) | st <- fileTags ]
 
 setTagSelection :: SourceView -> Maybe Tag -> IO ()
 setTagSelection SourceView{..} m_tag = do
@@ -950,7 +963,7 @@ updateSrcTagSelection view@SourceView{..} = do
     Just stag -> do
 
       -- Find file to show
-      let unit = fileName $ stagSource stag
+      let unit = stagFile stag
       fileView <- fileViewGet view unit
       notebookSetCurrentPage sourceBook (sourcePage fileView)
       updateTextTags view fileView
@@ -959,18 +972,19 @@ updateSrcTagSelection view@SourceView{..} = do
       -- Note: We are creating a mark here, as scrolling to an
       -- iterator position is not reiable with freshly opened text
       -- buffers.
-      let span = stagSource stag
-          buf = sourceBuffer fileView
-      textIter <- textBufferGetIterAtLineOffsetSafe buf
+      case stagSources stag of
+        (span:_) -> do
+          let buf = sourceBuffer fileView
+          textIter <- textBufferGetIterAtLineOffsetSafe buf
                   (startLine span) (startCol span)
-      let markName = "threadscope-scroll-mark"
-      m_scrollMark <- textBufferGetMark buf markName
-      scrollMark <- case m_scrollMark of
-        Just mark -> do textBufferMoveMark buf mark textIter
-                        return mark
-        Nothing   -> textBufferCreateMark buf (Just markName) textIter True
-      postGUIAsync $
-        textViewScrollToMark (sourceView fileView) scrollMark 0 (Just (0.5,0.5))
+          let markName = "threadscope-scroll-mark"
+          m_scrollMark <- textBufferGetMark buf markName
+          scrollMark <- case m_scrollMark of
+            Just mark -> do textBufferMoveMark buf mark textIter
+                            return mark
+            Nothing   -> textBufferCreateMark buf (Just markName) textIter True
+          textViewScrollToMark (sourceView fileView) scrollMark 0 (Just (0.5,0.5))
+        _ -> return ()
 
       -- Update labels
       updateFileBookLabels view
@@ -1010,8 +1024,8 @@ setSrcTagSelection SourceView{..} (Just stag) = do
       else return False
 
 sourceTagEquiv :: SourceTag -> SourceTag -> Bool
-sourceTagEquiv SourceTag{stagSource=s1} SourceTag{stagSource=s2}
-  = fileName s1 == fileName s2 && spanName s1 == spanName s2
+sourceTagEquiv st1 st2
+  = stagFile st1 == stagFile st2 && stagName st1 == stagName st2
 
 
 ------------------------------------------------------------------------------
@@ -1304,7 +1318,7 @@ updateTextTags SourceView{..} fw@FileView{..}= do
     Nothing  -> return ()
     Just sel -> do
       annotate (concatMap (findDebugSources . tagDebug) $ stagTags sel) False
-      annotate [stagSource sel] True
+      annotate (stagSources sel) True
 
 -- | From a list of tags, gives the source ranges that are covered by
 -- the tags in the given file.
@@ -1775,19 +1789,31 @@ containsSpan s1 s2
 -- might lead to the generated source ranges to cover more source than
 -- the original spans.
 subsumeSrcTags :: Bool -> [SourceTag] -> [SourceTag]
-subsumeSrcTags filesOnly = nubSumBy (cmpSpan `F.on` stagSource) plus
+subsumeSrcTags filesOnly = map mergeSources . nubSumBy cmpSpan plus
   where cmpSpan s1 s2
-          | filesOnly = fileName s1 `compare` fileName s2
-          | otherwise = (spanName s1, fileName s1) `compare` (spanName s2, fileName s2)
+          | filesOnly = stagFile s1 `compare` stagFile s2
+          | otherwise = (stagName s1, stagFile s1) `compare` (stagName s2, stagFile s2)
         plusSpan s1 s2 =
           let (sl, sc) = min (startLine s1, startCol s1) (startLine s2, startCol s2)
               (el, ec) = max (endLine s1, endCol s1) (endLine s2, endCol s2)
           in s1 { startLine = sl, startCol = sc, endLine = el, endCol = ec }
         plus st1 st2 = let tags' = nub (stagTags st1 ++ stagTags st2) in
-          st1 { stagSource = plusSpan (stagSource st1) (stagSource st2)
+          st1 { stagSources = stagSources st1 ++ stagSources st2
               , stagTags = tags'
               , stagFreq = sum $ map tagFreq tags' }
-
+        mergeSources st@SourceTag{stagSources}
+          = st { stagSources = merge $ sortBy (comparing spanStart) stagSources }
+        spanStart Span{..} = (startLine, startCol)
+        spanEnd Span{..} = (endLine, endCol)
+        merge (s1:ss@(s2:ss2))
+          | spanEnd s1 < spanStart s2
+            = s1:merge ss
+          | spanEnd s1 >= spanEnd s2
+            = merge (s1:ss2)
+          | otherwise
+            = let s1' = s1 { endLine = endLine s2, endCol = endCol s2 } 
+              in merge (s1':ss2)
+        merge ss = ss
 
 ------------------------------------------------------------------------------
 

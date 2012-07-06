@@ -1,24 +1,22 @@
 module GUI.Timeline.Render.Constants (
-    ox, oy, firstTraceY, tracePad,
-    hecTraceHeight, hecBarOff, hecBarHeight, hecLabelExtra,
-    activityGraphHeight,
+    ox, firstTraceY, tracePad,
+    hecTraceHeight, hecInstantHeight, hecSparksHeight,
+    hecBarOff, hecBarHeight, hecLabelExtra,
+    activityGraphHeight, stdHistogramHeight, histXScaleHeight,
     ticksHeight, ticksPad
   ) where
 
 -------------------------------------------------------------------------------
 
--- Origin for graph
+-- The standard gap in various graphs
 
 ox :: Int
 ox = 10
 
-oy :: Int
-oy = 30
-
--- Origin for capability bars
+-- Origin for traces
 
 firstTraceY :: Int
-firstTraceY = 60
+firstTraceY = 13
 
 -- Gap betweem traces in the timeline view
 
@@ -27,11 +25,12 @@ tracePad = 20
 
 -- HEC bar height
 
-hecTraceHeight, hecBarHeight, hecBarOff, hecLabelExtra :: Int
+hecTraceHeight, hecInstantHeight, hecBarHeight, hecBarOff, hecLabelExtra :: Int
 
-hecTraceHeight = 40
-hecBarHeight   = 20
-hecBarOff      = 10
+hecTraceHeight   = 40
+hecInstantHeight = 25
+hecBarHeight     = 20
+hecBarOff        = 10
 
 -- extra space to allow between HECs when labels are on.
 -- ToDo: should be calculated somehow
@@ -41,6 +40,19 @@ hecLabelExtra  = 80
 
 activityGraphHeight :: Int
 activityGraphHeight = 100
+
+-- Height of the spark graphs.
+hecSparksHeight :: Int
+hecSparksHeight = activityGraphHeight
+
+-- Histogram graph height when displayed with other traces (e.g., in PNG/PDF).
+stdHistogramHeight :: Int
+stdHistogramHeight = hecSparksHeight
+
+-- The X scale of histogram has this constant height, as opposed
+-- to the timeline X scale, which takes its height from the .ui file.
+histXScaleHeight :: Int
+histXScaleHeight = 30
 
 -- Ticks
 

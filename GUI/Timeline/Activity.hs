@@ -10,8 +10,6 @@ import Events.EventDuration
 import GUI.Types
 import GUI.ViewerColours
 
-import GHC.RTS.Events hiding (Event, GCWork, GCIdle)
-
 import Graphics.Rendering.Cairo
 
 import Control.Monad
@@ -28,18 +26,20 @@ renderActivity :: ViewParameters -> HECs -> Timestamp -> Timestamp
 
 renderActivity ViewParameters{..} hecs start0 end0 = do
   let
-      slice = round (fromIntegral activity_detail * scaleValue)
+      slice = ceiling (fromIntegral activity_detail * scaleValue)
 
       -- round the start time down, and the end time up, to a slice boundary
       start = (start0 `div` slice) * slice
       end   = ((end0 + slice) `div` slice) * slice
 
-      hec_profs  = map (actProfile slice start end) (map fst (hecTrees hecs))
+      hec_profs  = map (actProfile slice start end)
+                     (map (\ (t, _, _) -> t) (hecTrees hecs))
       total_prof = map sum (transpose hec_profs)
-  --
+
 --  liftIO $ printf "%s\n" (show (map length hec_profs))
 --  liftIO $ printf "%s\n" (show (map (take 20) hec_profs))
   drawActivity hecs start end slice total_prof
+               (if not bwMode then runningColour else black)
 
 activity_detail :: Int
 activity_detail = 4 -- in pixels
@@ -62,19 +62,19 @@ actProfile slice start0 end0 t
            | otherwise      = chopped0
 
    flatten :: Timestamp -> DurationTree -> [DurationTree] -> [DurationTree]
-   flatten start DurationTreeEmpty rest = rest
-   flatten start t@(DurationSplit s split e l r run _) rest
+   flatten _start DurationTreeEmpty rest = rest
+   flatten start t@(DurationSplit s split e l r _run _) rest
      | e   <= start   = rest
      | end <= s       = rest
      | start >= split = flatten start r rest
      | end   <= split = flatten start l rest
      | e - s > slice  = flatten start l $ flatten start r rest
      | otherwise      = t : rest
-   flatten start t@(DurationTreeLeaf d) rest
+   flatten _start t@(DurationTreeLeaf _) rest
      = t : rest
 
    chop :: Timestamp -> Timestamp -> [DurationTree] -> [Timestamp]
-   chop sofar start ts
+   chop sofar start _ts
      | start >= end = if sofar > 0 then [sofar] else []
    chop sofar start []
      = sofar : chop 0 (start+slice) []
@@ -86,26 +86,29 @@ actProfile slice start0 end0 t
      | s >= start + slice
      = sofar : chop 0 (start + slice) (t : ts)
      | e > start + slice
-     = (sofar + time_in_this_slice) : chop 0 (start + slice) (t : ts)
+     = (sofar + time_in_this_slice t) : chop 0 (start + slice) (t : ts)
      | otherwise
-     = chop (sofar + time_in_this_slice) start ts
+     = chop (sofar + time_in_this_slice t) start ts
     where
       (s, e)
         | DurationTreeLeaf ev <- t           = (startTimeOf ev, endTimeOf ev)
-        | DurationSplit s _ e _ _ run _ <- t = (s, e)
+        | DurationSplit s _ e _ _ _run _ <- t = (s, e)
 
-      duration = min (start+slice) e - max start s
+      mi = min (start + slice) e
+      ma = max start s
+      duration = if mi < ma then 0 else mi - ma
 
-      time_in_this_slice
-        | DurationTreeLeaf ThreadRun{} <- t  = duration
-        | DurationTreeLeaf _           <- t  = 0
-        | DurationSplit _ _ _ _ _ run _ <- t =
-               round (fromIntegral (run * duration) / fromIntegral (e-s))
-
+      time_in_this_slice t = case t of
+        DurationTreeLeaf ThreadRun{}  -> duration
+        DurationTreeLeaf _            -> 0
+        DurationSplit _ _ _ _ _ run _ ->
+          round (fromIntegral (run * duration) / fromIntegral (e-s))
+        DurationTreeEmpty             -> error "time_in_this_slice"
 
 drawActivity :: HECs -> Timestamp -> Timestamp -> Timestamp -> [Timestamp]
+             -> Color
              -> Render ()
-drawActivity hecs start end slice ts = do
+drawActivity hecs start end slice ts color = do
   case ts of
    [] -> return ()
    t:ts -> do
@@ -128,15 +131,12 @@ drawActivity hecs start end slice ts = do
      moveTo (dstart-dslice/2) (off t)
      zipWithM_ lineTo (tail [dstart-dslice/2, dstart+dslice/2 ..]) (map off ts)
      setSourceRGBAhex black 1.0
-     save
-     identityMatrix
      setLineWidth 1
      strokePreserve
-     restore
 
      lineTo dend   dheight
      lineTo dstart dheight
-     setSourceRGB 0 1 0
+     setSourceRGBAhex color 1.0
      fill
 
 -- funky gradients don't seem to work:
@@ -164,10 +164,13 @@ drawActivity hecs start end slice ts = do
             fromIntegral (t * fromIntegral activityGraphHeight) /
             fromIntegral (fromIntegral (hecCount hecs) * slice)
 
+-- | Draw a dashed line along the current path.
+dashedLine1 :: Render ()
 dashedLine1 = do
   save
   identityMatrix
-  setDash [10,10] 0.0
+  let dash = fromIntegral ox
+  setDash [dash, dash] 0.0
   setLineWidth 1
   stroke
   restore

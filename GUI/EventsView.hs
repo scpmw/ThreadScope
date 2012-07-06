@@ -13,11 +13,12 @@ module GUI.EventsView (
 import GHC.RTS.Events
 
 import Graphics.UI.Gtk
-import GUI.GtkExtras as GtkExt
+import qualified GUI.GtkExtras as GtkExt
 
 import Control.Monad.Reader
 import Data.Array
 import Data.IORef
+import Numeric
 
 -------------------------------------------------------------------------------
 
@@ -28,7 +29,7 @@ data EventsView = EventsView {
      }
 
 data EventsViewActions = EventsViewActions {
-       timelineViewCursorChanged :: Int -> IO ()
+       eventsViewCursorChanged :: Int -> IO ()
      }
 
 data ViewState = ViewState {
@@ -40,6 +41,7 @@ data EventsState
    = EventsEmpty
    | EventsLoaded {
        cursorPos  :: !Int,
+       mrange     :: !(Maybe (Int, Int)),
        eventsArr  :: Array Int CapEvent
      }
 
@@ -104,7 +106,7 @@ eventsViewNew builder EventsViewActions{..} = do
           case eventsState of
             EventsEmpty                        -> return ()
             EventsLoaded{cursorPos, eventsArr} ->
-                timelineViewCursorChanged cursorPos'
+                eventsViewCursorChanged cursorPos'
               where
                 cursorPos'    = clampBounds range (by pagejump end cursorPos)
                 range@(_,end) = bounds eventsArr
@@ -148,7 +150,7 @@ eventsViewNew builder EventsViewActions{..} = do
       widgetGrabFocus drawArea
       case hitpointToLine viewState yOffset y of
         Nothing -> return ()
-        Just n  -> timelineViewCursorChanged n
+        Just n  -> eventsViewCursorChanged n
 
   on drawArea scrollEvent $ do
     dir <- eventScrollDirection
@@ -180,6 +182,7 @@ eventsViewSetEvents eventWin@EventsView{drawArea, stateRef} mevents = do
         Nothing     -> EventsEmpty
         Just events -> EventsLoaded {
                           cursorPos  = 0,
+                          mrange = Nothing,
                           eventsArr  = events
                        }
       viewState' = viewState { eventsState = eventsState' }
@@ -196,15 +199,15 @@ eventsViewGetCursor EventsView{stateRef} = do
     EventsEmpty             -> return Nothing
     EventsLoaded{cursorPos} -> return (Just cursorPos)
 
-eventsViewSetCursor :: EventsView -> Int -> IO ()
-eventsViewSetCursor eventsView@EventsView{drawArea, stateRef} n = do
+eventsViewSetCursor :: EventsView -> Int -> Maybe (Int, Int) -> IO ()
+eventsViewSetCursor eventsView@EventsView{drawArea, stateRef} n mrange = do
   viewState@ViewState{eventsState} <- readIORef stateRef
   case eventsState of
     EventsEmpty             -> return ()
     EventsLoaded{eventsArr} -> do
       let n' = clampBounds (bounds eventsArr) n
       writeIORef stateRef viewState {
-        eventsState = eventsState { cursorPos = n' }
+        eventsState = eventsState { cursorPos = n', mrange }
       }
       eventsViewScrollToLine eventsView  n'
       widgetQueueDraw drawArea
@@ -273,22 +276,24 @@ drawEvents EventsView{drawArea, adj}
   (width,clipHeight) <- widgetGetSize drawArea
   let clipRect = Rectangle 0 0 width clipHeight
 
-  let --TODO: calculate based on average char width and n digits
-      timeWidth  = 120
+  let -- With average char width, timeWidth is enough for 24 hours of logs
+      -- (way more than TS can handle, currently). Aligns nicely with
+      -- current timeline_yscale_area width, too.
+      -- TODO: take timeWidth from the yScaleDrawingArea width
+      -- TODO: perhaps make the timeWidth area grey, too?
+      -- TODO: perhaps limit scroll to the selected interval (perhaps not strictly, but only so that the interval area does not completely vanish from the visible area)?
+      timeWidth  = 105
       columnGap  = 20
       descrWidth = width - timeWidth - columnGap
 
   sequence_
-    [ do when selected $
+    [ do when (inside || selected) $
            GtkExt.stylePaintFlatBox
              style win
-             state ShadowNone
+             state1 ShadowNone
              clipRect
              drawArea ""
              0 (round y) width (round lineHeight)
-
-         let state' | selected  = state
-                    | otherwise = StateNormal
 
          -- The event time
          layoutSetText layout (showEventTime event)
@@ -296,7 +301,7 @@ drawEvents EventsView{drawArea, adj}
          layoutSetWidth layout (Just (fromIntegral timeWidth))
          GtkExt.stylePaintLayout
            style win
-           state' True
+           state2 True
            clipRect
            drawArea ""
            0 (round y)
@@ -308,7 +313,7 @@ drawEvents EventsView{drawArea, adj}
          layoutSetWidth layout (Just (fromIntegral descrWidth))
          GtkExt.stylePaintLayout
            style win
-           state' True
+           state2 True
            clipRect
            drawArea ""
            (timeWidth + columnGap) (round y)
@@ -317,20 +322,26 @@ drawEvents EventsView{drawArea, adj}
     | n <- [begin..end]
     , let y = fromIntegral n * lineHeight - yOffset
           event    = eventsArr ! n
+          inside   = maybe False (\ (s, e) -> s <= n && n <= e) mrange
           selected = cursorPos == n
+          (state1, state2)
+            | inside    = (StatePrelight, StatePrelight)
+            | selected  = (state, state)
+            | otherwise = (state, StateNormal)
     ]
 
   where
-    showEventTime  (CapEvent _cap (Event  time _spec)) = show time
+    showEventTime  (CapEvent _cap (Event  time _spec)) =
+      showFFloat (Just 6) (fromIntegral time / 1000000) "s"
     showEventDescr (CapEvent  cap (Event _time  spec)) =
         (case cap of
           Nothing -> ""
-          Just c  -> "cap " ++ show c ++ ": ")
+          Just c  -> "HEC " ++ show c ++ ": ")
      ++ case spec of
           UnknownEvent{ref} -> "unknown event; " ++ show ref
           Message     msg   -> msg
           UserMessage msg   -> msg
-          _                 -> showEventTypeSpecificInfo spec
+          _                 -> showEventInfo spec
 
 -------------------------------------------------------------------------------
 

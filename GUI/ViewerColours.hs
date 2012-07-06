@@ -3,7 +3,7 @@
 --- $Source: //depot/satnams/haskell/ThreadScope/ViewerColours.hs $
 -------------------------------------------------------------------------------
 
-module GUI.ViewerColours where
+module GUI.ViewerColours (Color, module GUI.ViewerColours) where
 
 import Graphics.UI.Gtk
 import Graphics.Rendering.Cairo
@@ -13,28 +13,19 @@ import Graphics.Rendering.Cairo
 -- Colours
 
 runningColour :: Color
-runningColour = green
+runningColour = darkGreen
 
 gcColour :: Color
 gcColour = orange
 
 gcStartColour, gcWorkColour, gcIdleColour, gcEndColour :: Color
 gcStartColour = orange
-gcWorkColour  = green
+gcWorkColour  = orange
 gcIdleColour  = white
 gcEndColour   = orange
 
 createThreadColour :: Color
 createThreadColour = lightBlue
-
-runSparkColour :: Color
-runSparkColour = darkBlue
-
-stealSparkColour :: Color
-stealSparkColour = magenta
-
-threadRunnableColour :: Color
-threadRunnableColour = darkGreen
 
 seqGCReqColour :: Color
 seqGCReqColour = cyan
@@ -46,7 +37,7 @@ migrateThreadColour :: Color
 migrateThreadColour = darkRed
 
 threadWakeupColour :: Color
-threadWakeupColour = purple
+threadWakeupColour = green
 
 shutdownColour :: Color
 shutdownColour = darkBrown
@@ -57,6 +48,17 @@ labelTextColour = black
 bookmarkColour :: Color
 bookmarkColour = Color 0xff00 0x0000 0xff00 -- pinkish
 
+fizzledDudsColour, createdConvertedColour, overflowedColour :: Color
+fizzledDudsColour      = grey
+createdConvertedColour = darkGreen
+overflowedColour       = red
+
+userMessageColour :: Color
+userMessageColour = darkRed
+
+outerPercentilesColour :: Color
+outerPercentilesColour = lightGrey
+
 -------------------------------------------------------------------------------
 
 black :: Color
@@ -64,6 +66,15 @@ black = Color 0 0 0
 
 grey :: Color
 grey = Color 0x8000 0x8000 0x8000
+
+lightGrey :: Color
+lightGrey = Color 0xD000 0xD000 0xD000
+
+gtkBorderGrey :: Color
+gtkBorderGrey = Color 0xF200 0xF100 0xF000
+
+red :: Color
+red = Color 0xFFFF 0 0
 
 green :: Color
 green = Color 0 0xFFFF 0
@@ -96,7 +107,7 @@ darkRed :: Color
 darkRed = Color 0xcc00 0x0000 0x0000
 
 orange :: Color
-orange = Color 0xFFFF 0x9900 0x0000 -- orange
+orange = Color 0xE000 0x7000 0x0000 -- orange
 
 profileBackground :: Color
 profileBackground = Color 0xFFFF 0xFFFF 0xFFFF

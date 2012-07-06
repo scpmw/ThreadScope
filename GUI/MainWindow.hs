@@ -1,7 +1,3 @@
-{-# LANGUAGE CPP #-}
--- ThreadScope: a graphical viewer for Haskell event log information.
--- Maintainer: satnams@microsoft.com, s.singh@ieee.org
-
 module GUI.MainWindow (
     MainWindow,
     mainWindowNew,
@@ -18,8 +14,7 @@ import Paths_threadscope
 
 -- Imports for GTK
 import Graphics.UI.Gtk as Gtk
-import Graphics.UI.Gtk.Gdk.Events as Old hiding (eventModifier)
-import System.Glib.GObject as Glib
+import qualified System.Glib.GObject as Glib
 
 
 -------------------------------------------------------------------------------
@@ -48,17 +43,17 @@ data MainWindowActions = MainWindowActions {
 
        -- Menu actions
        mainWinOpen          :: IO (),
-       mainWinSavePDF       :: IO (),
-       mainWinSavePNG       :: IO (),
+       mainWinExport        :: IO (),
        mainWinQuit          :: IO (),
        mainWinViewSidebar   :: Bool -> IO (),
        mainWinViewEvents    :: Bool -> IO (),
        mainWinViewBW        :: Bool -> IO (),
-       mainWinViewRefresh   :: IO (),
+       mainWinViewReload    :: IO (),
+       mainWinWebsite       :: IO (),
+       mainWinTutorial      :: IO (),
        mainWinAbout         :: IO (),
 
        -- Toolbar actions
-       --TODO: all toolbar actions should also be available from the menu
        mainWinJumpStart     :: IO (),
        mainWinJumpEnd       :: IO (),
        mainWinJumpCursor    :: IO (),
@@ -111,39 +106,45 @@ mainWindowNew builder actions = do
   eventsBox          <- getWidget castToWidget "eventsbox"
 
   bwToggle           <- getWidget castToCheckMenuItem "black_and_white"
+  labModeToggle      <- getWidget castToCheckMenuItem "view_labels_mode"
   sidebarToggle      <- getWidget castToCheckMenuItem "view_sidebar"
   eventsToggle       <- getWidget castToCheckMenuItem "view_events"
   openMenuItem       <- getWidget castToMenuItem "openMenuItem"
-  saveAsPDFMenuItem  <- getWidget castToMenuItem "saveAsPDFMenuItem"
-  saveAsPNGMenuItem  <- getWidget castToMenuItem "saveAsPNGMenuItem"
+  exportMenuItem     <- getWidget castToMenuItem "exportMenuItem"
   reloadMenuItem     <- getWidget castToMenuItem "view_reload"
   quitMenuItem       <- getWidget castToMenuItem "quitMenuItem"
+  websiteMenuItem    <- getWidget castToMenuItem "websiteMenuItem"
+  tutorialMenuItem   <- getWidget castToMenuItem "tutorialMenuItem"
   aboutMenuItem      <- getWidget castToMenuItem "aboutMenuItem"
 
-  timelineViewport   <- getWidget castToWidget "timeline_viewport"
---  timelineDrawingArea      <- getWidget castToDrawingArea "timeline_drawingarea"
---  timelineLabelDrawingArea <- getWidget castToDrawingArea "timeline_labels_drawingarea"
---  timelineHScrollbar  <- getWidget castToHScrollbar "timeline_hscroll"
---  timelineVScrollbar  <- getWidget castToVScrollbar "timeline_vscroll"
---  timelineAdj         <- rangeGetAdjustment timelineHScrollbar
---  timelineVAdj        <- rangeGetAdjustment timelineVScrollbar
+  firstMenuItem      <- getWidget castToMenuItem "move_first"
+  centreMenuItem     <- getWidget castToMenuItem "move_centre"
+  lastMenuItem       <- getWidget castToMenuItem "move_last"
+
+  zoomInMenuItem     <- getWidget castToMenuItem "move_zoomin"
+  zoomOutMenuItem    <- getWidget castToMenuItem "move_zoomout"
+  zoomFitMenuItem    <- getWidget castToMenuItem "move_zoomfit"
+
+  openButton         <- getWidget castToToolButton "cpus_open"
+
+  firstButton        <- getWidget castToToolButton "cpus_first"
+  centreButton       <- getWidget castToToolButton "cpus_centre"
+  lastButton         <- getWidget castToToolButton "cpus_last"
 
   zoomInButton       <- getWidget castToToolButton "cpus_zoomin"
   zoomOutButton      <- getWidget castToToolButton "cpus_zoomout"
   zoomFitButton      <- getWidget castToToolButton "cpus_zoomfit"
 
-  showLabelsToggle   <- getWidget castToToggleToolButton "cpus_showlabels"
-  firstButton        <- getWidget castToToolButton "cpus_first"
-  lastButton         <- getWidget castToToolButton "cpus_last"
-  centreButton       <- getWidget castToToolButton "cpus_centre"
-
-  --TODO: these two are currently unbound, but they should be!
-  --  eventsTextEntry    <- getWidget castToEntry      "events_entry"
-  --  eventsFindButton   <- getWidget castToToolButton "events_find"
+  --TODO: this is currently not used, but it'be nice if it were!
+  eventsTextEntry    <- getWidget castToEntry      "events_entry"
 
   ------------------------------------------------------------------------
+  -- Show everything
+  widgetShowAll mainWindow
 
-  widgetSetAppPaintable mainWindow True --TODO: Really?
+  widgetHide eventsTextEntry  -- for now we hide it, see above.
+
+  ------------------------------------------------------------------------
 
   logoPath <- getDataFileName "threadscope.png"
   windowSetIconFromFile mainWindow logoPath
@@ -156,49 +157,45 @@ mainWindowNew builder actions = do
 
   ------------------------------------------------------------------------
   -- Bind all the events
-  
+
   -- Menus
   on openMenuItem      menuItemActivate $ mainWinOpen actions
-  on saveAsPDFMenuItem menuItemActivate $ mainWinSavePDF actions
-  on saveAsPNGMenuItem menuItemActivate $ mainWinSavePNG actions
+  on exportMenuItem    menuItemActivate $ mainWinExport actions
 
   on quitMenuItem menuItemActivate $ mainWinQuit actions
   on mainWindow   objectDestroy    $ mainWinQuit actions
 
   on sidebarToggle  checkMenuItemToggled $ checkMenuItemGetActive sidebarToggle
-                                       >>= mainWinViewSidebar actions
+                                       >>= mainWinViewSidebar   actions
   on eventsToggle   checkMenuItemToggled $ checkMenuItemGetActive eventsToggle
-                                       >>= mainWinViewEvents  actions
+                                       >>= mainWinViewEvents    actions
   on bwToggle       checkMenuItemToggled $ checkMenuItemGetActive bwToggle
-                                       >>= mainWinViewBW      actions
-  on reloadMenuItem menuItemActivate     $ mainWinViewRefresh actions
+                                       >>= mainWinViewBW        actions
+  on labModeToggle  checkMenuItemToggled $ checkMenuItemGetActive labModeToggle
+                                       >>= mainWinDisplayLabels actions
+  on reloadMenuItem menuItemActivate     $ mainWinViewReload actions
 
-  on aboutMenuItem  menuItemActivate     $ mainWinAbout actions
+  on websiteMenuItem  menuItemActivate    $ mainWinWebsite actions
+  on tutorialMenuItem menuItemActivate    $ mainWinTutorial actions
+  on aboutMenuItem    menuItemActivate    $ mainWinAbout actions
 
-  -- Toolbar  
+  on firstMenuItem   menuItemActivate     $ mainWinJumpStart  actions
+  on centreMenuItem  menuItemActivate     $ mainWinJumpCursor actions
+  on lastMenuItem    menuItemActivate     $ mainWinJumpEnd    actions
+
+  on zoomInMenuItem  menuItemActivate     $ mainWinJumpZoomIn  actions
+  on zoomOutMenuItem menuItemActivate     $ mainWinJumpZoomOut actions
+  on zoomFitMenuItem menuItemActivate     $ mainWinJumpZoomFit actions
+
+  -- Toolbar
+  onToolButtonClicked openButton $ mainWinOpen       actions
+
   onToolButtonClicked firstButton  $ mainWinJumpStart  actions
-  onToolButtonClicked lastButton   $ mainWinJumpEnd    actions
   onToolButtonClicked centreButton $ mainWinJumpCursor actions
+  onToolButtonClicked lastButton   $ mainWinJumpEnd    actions
 
   onToolButtonClicked zoomInButton  $ mainWinJumpZoomIn  actions
   onToolButtonClicked zoomOutButton $ mainWinJumpZoomOut actions
   onToolButtonClicked zoomFitButton $ mainWinJumpZoomFit actions
-   
-  onToolButtonToggled showLabelsToggle $
-    toggleToolButtonGetActive showLabelsToggle >>= mainWinDisplayLabels actions
-
-  -- Key bindings
-  --TODO: move these to the timeline module
-  onKeyPress timelineViewport $ \Key { Old.eventKeyName = key, eventKeyChar = mch } ->
-    case (key, mch) of
-      ("Right", _)   -> mainWinScrollRight actions >> return True
-      ("Left",  _)   -> mainWinScrollLeft  actions >> return True
-      (_ , Just '+') -> mainWinJumpZoomIn  actions >> return True
-      (_ , Just '-') -> mainWinJumpZoomOut actions >> return True
-      _              -> return False
-
-  ------------------------------------------------------------------------
-  -- Show all windows
-  widgetShowAll mainWindow
 
   return MainWindow {..}

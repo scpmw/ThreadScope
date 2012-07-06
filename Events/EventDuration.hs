@@ -84,7 +84,7 @@ durationOf ed = endTimeOf ed - startTimeOf ed
 -------------------------------------------------------------------------------
 
 eventsToDurations :: [GHC.Event] -> [EventDuration]
-eventsToDurations []     = []
+eventsToDurations [] = []
 eventsToDurations (event : events) =
   case spec event of
      RunThread{thread=t} -> runDuration t : rest
@@ -96,7 +96,7 @@ eventsToDurations (event : events) =
     rest = eventsToDurations events
 
     runDuration t = ThreadRun t s (time event) endTime
-       where (endTime, s) = case findRunThreadTime events of
+       where (endTime, s) = case findRunThreadTime (event:events) of
                               Nothing -> error $ "findRunThreadTime for " ++ (show event)
                               Just x -> x
 
@@ -110,10 +110,11 @@ isDiscreteEvent e =
     GHC.GCWork{} -> False
     GHC.GCIdle{} -> False
     GHC.GCDone{} -> False
+    GHC.SparkCounters{} -> False
     _            -> True
 
 gcStart :: Timestamp -> [GHC.Event] -> [EventDuration]
-gcStart t0 [] = []
+gcStart _  [] = []
 gcStart t0 (event : events) =
   case spec event of
     GHC.GCWork{} -> GCStart t0 t1 : gcWork t1 events
@@ -126,7 +127,7 @@ gcStart t0 (event : events) =
         t1 = time event
 
 gcWork :: Timestamp -> [GHC.Event] -> [EventDuration]
-gcWork t0 [] = []
+gcWork _  [] = []
 gcWork t0 (event : events) =
   case spec event of
     GHC.GCWork{} -> gcWork t0 events
@@ -139,7 +140,7 @@ gcWork t0 (event : events) =
         t1 = time event
 
 gcIdle :: Timestamp -> [GHC.Event] -> [EventDuration]
-gcIdle t0 [] = []
+gcIdle _  [] = []
 gcIdle t0 (event : events) =
   case spec event of
     GHC.GCIdle{} -> gcIdle t0 events
@@ -152,7 +153,7 @@ gcIdle t0 (event : events) =
         t1 = time event
 
 gcDone :: Timestamp -> [GHC.Event] -> [EventDuration]
-gcDone t0 [] = []
+gcDone _  [] = []
 gcDone t0 (event : events) =
   case spec event of
     GHC.GCDone{} -> gcDone t0 events
@@ -168,6 +169,7 @@ gcDone t0 (event : events) =
 
 findRunThreadTime :: [GHC.Event] -> Maybe (Timestamp, ThreadStopStatus)
 findRunThreadTime [] = Nothing
+findRunThreadTime [e] = Just (time e, NoStatus)
 findRunThreadTime (e : es)
   = case spec e of
       StopThread{status=s} -> Just (time e, s)

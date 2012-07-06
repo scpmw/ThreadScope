@@ -1,11 +1,8 @@
 {-# LANGUAGE CPP #-}
--- ThreadScope: a graphical viewer for Haskell event log information.
--- Maintainer: satnams@microsoft.com, s.singh@ieee.org
-
 module GUI.Main (runGUI) where
 
 -- Imports for GTK
-import Graphics.UI.Gtk as Gtk
+import qualified Graphics.UI.Gtk as Gtk
 import System.Glib.GError (failOnGError)
 
 -- Imports from Haskell library
@@ -16,17 +13,23 @@ import System.Posix
 #endif
 import Control.Concurrent
 import qualified Control.Concurrent.Chan as Chan
+import Control.Exception
+import Prelude hiding (catch)
 import Data.Array
+import Data.Maybe
 
 import Paths_threadscope
 
 -- Imports for ThreadScope
-import GUI.MainWindow as MainWindow
+import qualified GUI.MainWindow as MainWindow
 import GUI.Types
 import Events.HECs hiding (Event)
 import GUI.Dialogs
 import Events.ReadEvents
 import GUI.EventsView
+import GUI.SummaryView
+import GUI.StartupInfoView
+import GUI.Histogram
 import GUI.Timeline
 import GUI.TraceView
 import GUI.BookmarkView
@@ -35,13 +38,17 @@ import GUI.SourceView
 import GUI.SaveAs
 import qualified GUI.ConcurrencyControl as ConcurrencyControl
 import qualified GUI.ProgressView as ProgressView
+import qualified GUI.GtkExtras as GtkExtras
 
 -------------------------------------------------------------------------------
 
 data UIEnv = UIEnv {
 
-       mainWin       :: MainWindow,
+       mainWin       :: MainWindow.MainWindow,
        eventsView    :: EventsView,
+       startupView   :: StartupInfoView,
+       summaryView   :: SummaryView,
+       histogramView :: HistogramView,
        timelineWin   :: TimelineView,
        traceView     :: TraceView,
        bookmarkView  :: BookmarkView,
@@ -57,11 +64,9 @@ data EventlogState
    | EventlogLoaded {
        mfilename :: Maybe FilePath, --test traces have no filepath
        hecs      :: HECs,
-       cursorTs  :: Timestamp,
+       selection :: TimeSelection,
        cursorPos :: Int
      }
-
-data FileSaveFormat = FormatPDF | FormatPNG
 
 postEvent :: Chan Event -> Event -> IO ()
 postEvent = Chan.writeChan
@@ -71,16 +76,19 @@ getEvent = Chan.readChan
 
 data Event
    = EventOpenDialog
+   | EventExportDialog
+   | EventLaunchWebsite
+   | EventLaunchTutorial
    | EventAboutDialog
    | EventQuit
 
    | EventFileLoad   FilePath
    | EventTestLoad   String
    | EventFileReload
-   | EventFileSave   FileSaveFormat
+   | EventFileExport FilePath FileExportFormat
 
 -- | EventStateClear
-   | EventSetState (Maybe FilePath) HECs
+   | EventSetState HECs (Maybe FilePath) String Int Double
 
    | EventShowSidebar Bool
    | EventShowEvents  Bool
@@ -93,34 +101,39 @@ data Event
    | EventTimelineZoomIn
    | EventTimelineZoomOut
    | EventTimelineZoomToFit
-   | EventTimelineShowLabels Bool
+   | EventTimelineLabelsMode Bool
    | EventTimelineShowBW     Bool
 
    | EventCursorChangedIndex     Int
-   | EventCursorChangedTimestamp Timestamp
+   | EventCursorChangedSelection TimeSelection
 
    | EventTracesChanged [Trace]
 
    | EventBookmarkAdd
-   | EventBookmarRemove Int
+   | EventBookmarkRemove Int
+   | EventBookmarkEdit   Int String
+
+   | EventUserError String SomeException
+                    -- can add more specific ones if necessary
 
 constructUI :: IO UIEnv
 constructUI = failOnGError $ do
 
-  builder <- builderNew
-  builderAddFromFile builder =<< getDataFileName "threadscope.ui"
+  builder <- Gtk.builderNew
+  Gtk.builderAddFromFile builder =<< getDataFileName "threadscope.ui"
 
   eventQueue <- Chan.newChan
   let post = postEvent eventQueue
 
-  mainWin <- mainWindowNew builder MainWindowActions {
+  mainWin <- MainWindow.mainWindowNew builder MainWindow.MainWindowActions {
     mainWinOpen          = post EventOpenDialog,
-    mainWinSavePDF       = post (EventFileSave FormatPDF),
-    mainWinSavePNG       = post (EventFileSave FormatPNG),
+    mainWinExport        = post EventExportDialog,
     mainWinQuit          = post EventQuit,
     mainWinViewSidebar   = post . EventShowSidebar,
     mainWinViewEvents    = post . EventShowEvents,
-    mainWinViewRefresh   = post EventFileReload,
+    mainWinViewReload    = post EventFileReload,
+    mainWinWebsite       = post EventLaunchWebsite,
+    mainWinTutorial      = post EventLaunchTutorial,
     mainWinAbout         = post EventAboutDialog,
     mainWinJumpStart     = post EventTimelineJumpStart,
     mainWinJumpEnd       = post EventTimelineJumpEnd,
@@ -130,17 +143,22 @@ constructUI = failOnGError $ do
     mainWinJumpZoomIn    = post EventTimelineZoomIn,
     mainWinJumpZoomOut   = post EventTimelineZoomOut,
     mainWinJumpZoomFit   = post EventTimelineZoomToFit,
-    mainWinDisplayLabels = post . EventTimelineShowLabels,
+    mainWinDisplayLabels = post . EventTimelineLabelsMode,
     mainWinViewBW        = post . EventTimelineShowBW
   }
 
   timelineWin <- timelineViewNew builder TimelineViewActions {
-    timelineViewCursorChanged = post . EventCursorChangedTimestamp
+    timelineViewSelectionChanged = post . EventCursorChangedSelection
   }
 
   eventsView <- eventsViewNew builder EventsViewActions {
-    timelineViewCursorChanged = post . EventCursorChangedIndex
+    eventsViewCursorChanged = post . EventCursorChangedIndex
   }
+
+  startupView <- startupInfoViewNew builder
+  summaryView <- summaryViewNew builder
+
+  histogramView <- histogramViewNew builder
 
   traceView <- traceViewNew builder TraceViewActions {
     traceViewTracesChanged = post . EventTracesChanged
@@ -151,9 +169,11 @@ constructUI = failOnGError $ do
 
   bookmarkView <- bookmarkViewNew builder BookmarkViewActions {
     bookmarkViewAddBookmark    = post EventBookmarkAdd,
-    bookmarkViewRemoveBookmark = post . EventBookmarRemove,
-    bookmarkViewGotoBookmark   = \ts -> post (EventCursorChangedTimestamp ts)
-                                     >> post EventTimelineJumpCursor
+    bookmarkViewRemoveBookmark = post . EventBookmarkRemove,
+    bookmarkViewGotoBookmark   = \ts -> do
+      post (EventCursorChangedSelection (PointSelection ts))
+      post EventTimelineJumpCursor,
+    bookmarkViewEditLabel      = \n v -> post (EventBookmarkEdit n v)
   }
 
   keyView <- keyViewNew builder
@@ -171,6 +191,10 @@ eventLoop uienv@UIEnv{..} eventlogState = do
 
     event <- getEvent eventQueue
     next  <- dispatch event eventlogState
+#if __GLASGOW_HASKELL__ <= 612
+               -- workaround for a wierd exception handling bug in ghc-6.12
+               `catch` \e -> throwIO (e :: SomeException)
+#endif
     case next of
       Left  LoopDone       -> return ()
       Right eventlogState' -> eventLoop uienv eventlogState'
@@ -186,41 +210,93 @@ eventLoop uienv@UIEnv{..} eventlogState = do
       continue
 
     dispatch (EventFileLoad filename) _ = do
-      forkIO $ loadEvents (Just filename) (registerEventsFromFile filename)
+      async "loading the eventlog" $
+        loadEvents (Just filename) (registerEventsFromFile filename)
       --TODO: set state to be empty during loading
       continue
 
     dispatch (EventTestLoad testname) _ = do
-      forkIO $ loadEvents Nothing (registerEventsFromTrace testname)
+      async "loading the test eventlog" $
+        loadEvents Nothing (registerEventsFromTrace testname)
       --TODO: set state to be empty during loading
       continue
 
     dispatch EventFileReload EventlogLoaded{mfilename = Just filename} = do
-      forkIO $ loadEvents (Just filename) (registerEventsFromFile filename)
+      async "reloading the eventlog" $
+        loadEvents (Just filename) (registerEventsFromFile filename)
       --TODO: set state to be empty during loading
+      continue
+
+    dispatch EventFileReload EventlogLoaded{mfilename = Nothing} =
       continue
 
 --    dispatch EventClearState _
 
-    dispatch (EventSetState mfilename hecs) _ =
-      continueWith EventlogLoaded {
-        mfilename = mfilename,
-        hecs      = hecs,
-        cursorTs  = 0,
-        cursorPos = 0
-      }
+    dispatch (EventSetState hecs mfilename name nevents timespan) _ = do
 
-    dispatch (EventFileSave format)
-             EventlogLoaded {hecs, mfilename = Just filename} = do
+      MainWindow.setFileLoaded mainWin (Just name)
+      MainWindow.setStatusMessage mainWin $
+        printf "%s (%d events, %.3fs)" name nevents timespan
+
+      let mevents = Just $ hecEventArray hecs
+      eventsViewSetEvents eventsView mevents
+      sourceViewSetEvents sourceView mfilename (Just $ hecEventArray hecs)
+      startupInfoViewSetEvents startupView mevents
+      summaryViewSetEvents summaryView mevents
+      histogramViewSetHECs histogramView (Just hecs)
+      traceViewSetHECs traceView hecs
+      traces' <- traceViewGetTraces traceView
+      timelineWindowSetHECs timelineWin (Just hecs)
+      timelineWindowSetTraces timelineWin traces'
+
+      -- TODO: disabled for now, until it's configurable (see the TODO file)
+      -- We set user 'traceEvent' messages as initial bookmarks.
+      -- This is somewhat of an experiment. If users use lots of trace events
+      -- then it will not be appropriate and we'll want a separate 'traceMark'.
+      --let usrMsgs = extractUserMessages hecs
+      --sequence_ [ bookmarkViewAdd bookmarkView ts label
+      --          | (ts, label) <- usrMsgs ]
+      -- timelineWindowSetBookmarks timelineWin (map fst usrMsgs)
+      bookmarkViewClear bookmarkView
+      timelineWindowSetBookmarks timelineWin []
+
+      if nevents == 0
+        then continueWith NoEventlogLoaded
+        else continueWith EventlogLoaded
+          { mfilename = mfilename
+          , hecs      = hecs
+          , selection = PointSelection 0
+          , cursorPos = 0
+          }
+
+    dispatch EventExportDialog
+             EventlogLoaded {mfilename} = do
+      exportFileDialog mainWin (fromMaybe "" mfilename) $ \filename' format ->
+        post (EventFileExport filename' format)
+      continue
+
+    dispatch (EventFileExport filename format)
+             EventlogLoaded {hecs} = do
       viewParams <- timelineGetViewParameters timelineWin
       let viewParams' = viewParams {
                           detail     = 1,
                           bwMode     = False,
                           labelsMode = False
                         }
+      let yScaleArea = timelineGetYScaleArea timelineWin
       case format of
-        FormatPDF -> saveAsPDF filename hecs viewParams'
-        FormatPNG -> saveAsPDF filename hecs viewParams'
+        FormatPDF ->
+          saveAsPDF filename hecs viewParams' yScaleArea
+        FormatPNG ->
+          saveAsPNG filename hecs viewParams' yScaleArea
+      continue
+
+    dispatch EventLaunchWebsite _ = do
+      GtkExtras.launchProgramForURI "http://www.haskell.org/haskellwiki/ThreadScope"
+      continue
+
+    dispatch EventLaunchTutorial _ = do
+      GtkExtras.launchProgramForURI "http://www.haskell.org/haskellwiki/ThreadScope_Tour"
       continue
 
     dispatch EventAboutDialog _ = do
@@ -247,7 +323,7 @@ eventLoop uienv@UIEnv{..} eventlogState = do
       continue
 
     dispatch EventTimelineJumpCursor EventlogLoaded{cursorPos} = do
-      timelineCentreOnCursor timelineWin --TODO: pass cursorTs here
+      timelineCentreOnCursor timelineWin --TODO: pass selection here
       eventsViewScrollToLine eventsView cursorPos
       continue
 
@@ -268,8 +344,8 @@ eventLoop uienv@UIEnv{..} eventlogState = do
       timelineZoomToFit timelineWin
       continue
 
-    dispatch (EventTimelineShowLabels showLabels) _ = do
-      timelineSetShowLabels timelineWin showLabels
+    dispatch (EventTimelineLabelsMode labelsMode) _ = do
+      timelineSetLabelsMode timelineWin labelsMode
       continue
 
     dispatch (EventTimelineShowBW showBW) _ = do
@@ -277,22 +353,39 @@ eventLoop uienv@UIEnv{..} eventlogState = do
       continue
 
     dispatch (EventCursorChangedIndex cursorPos') EventlogLoaded{hecs} = do
-      let cursorTs' = eventIndexToTimestamp hecs cursorPos'
-      timelineSetCursor   timelineWin cursorTs'
-      eventsViewSetCursor eventsView  cursorPos'
+      let cursorTs'  = eventIndexToTimestamp hecs cursorPos'
+          selection' = PointSelection cursorTs'
+      timelineSetSelection timelineWin selection'
+      eventsViewSetCursor eventsView  cursorPos' Nothing
       sourceViewSetCursor sourceView  cursorPos'
       continueWith eventlogState {
-        cursorTs  = cursorTs',
+        selection = selection',
         cursorPos = cursorPos'
       }
 
-    dispatch (EventCursorChangedTimestamp cursorTs') EventlogLoaded{hecs} = do
+    dispatch (EventCursorChangedSelection selection'@(PointSelection cursorTs'))
+             EventlogLoaded{hecs} = do
       let cursorPos' = timestampToEventIndex hecs cursorTs'
-      timelineSetCursor   timelineWin cursorTs'
-      eventsViewSetCursor eventsView  cursorPos'
-      sourceViewSetCursor sourceView  cursorPos'
+      timelineSetSelection timelineWin selection'
+      eventsViewSetCursor eventsView cursorPos' Nothing
+      sourceViewSetCursor sourceView cursorPos'
+      histogramViewSetInterval histogramView Nothing
+      summaryViewSetInterval summaryView Nothing
       continueWith eventlogState {
-        cursorTs  = cursorTs',
+        selection = selection',
+        cursorPos = cursorPos'
+      }
+
+    dispatch (EventCursorChangedSelection selection'@(RangeSelection start end))
+             EventlogLoaded{hecs} = do
+      let cursorPos' = timestampToEventIndex hecs start
+          mrange = Just (cursorPos', timestampToEventIndex hecs end)
+      timelineSetSelection timelineWin selection'
+      eventsViewSetCursor eventsView cursorPos' mrange
+      histogramViewSetInterval histogramView (Just (start, end))
+      summaryViewSetInterval summaryView (Just (start, end))
+      continueWith eventlogState {
+        selection = selection',
         cursorPos = cursorPos'
       }
 
@@ -300,32 +393,51 @@ eventLoop uienv@UIEnv{..} eventlogState = do
       timelineWindowSetTraces timelineWin traces
       continue
 
-    dispatch EventBookmarkAdd EventlogLoaded{cursorTs} = do
-      bookmarkViewAdd bookmarkView cursorTs
-      timelineWindowSetBookmarks timelineWin =<< bookmarkViewGet bookmarkView
+    dispatch EventBookmarkAdd EventlogLoaded{selection} = do
+      case selection of
+        PointSelection a   -> bookmarkViewAdd bookmarkView a ""
+        RangeSelection a b -> do bookmarkViewAdd bookmarkView a ""
+                                 bookmarkViewAdd bookmarkView b ""
+      --TODO: should have a way to add/set a single bookmark for the timeline
+      -- rather than this hack where we ask the bookmark view for the whole lot.
+      ts <- bookmarkViewGet bookmarkView
+      timelineWindowSetBookmarks timelineWin (map fst ts)
       continue
 
-    dispatch (EventBookmarRemove n) _ = do
+    dispatch (EventBookmarkRemove n) _ = do
       bookmarkViewRemove bookmarkView n
-      timelineWindowSetBookmarks timelineWin =<< bookmarkViewGet bookmarkView
+      --TODO: should have a way to add/set a single bookmark for the timeline
+      -- rather than this hack where we ask the bookmark view for the whole lot.
+      ts <- bookmarkViewGet bookmarkView
+      timelineWindowSetBookmarks timelineWin (map fst ts)
       continue
+
+    dispatch (EventBookmarkEdit n v) _ = do
+      bookmarkViewSetLabel bookmarkView n v
+      continue
+
+    dispatch (EventUserError doing exception) _ = do
+      let headline    = "There was a problem " ++ doing ++ "."
+          explanation = show exception
+      errorMessageDialog mainWin headline explanation
+      continue
+
+    dispatch _ NoEventlogLoaded = continue
 
     loadEvents mfilename registerEvents = do
       ConcurrencyControl.fullSpeed concCtl $
         ProgressView.withProgress mainWin $ \progress -> do
           (hecs, name, nevents, timespan) <- registerEvents progress
-          MainWindow.setFileLoaded mainWin (Just name)
-          MainWindow.setStatusMessage mainWin $
-            printf "%s (%d events, %.3fs)" name nevents timespan
-
-          eventsViewSetEvents eventsView (Just (hecEventArray hecs))
-          sourceViewSetEvents sourceView mfilename (Just $ hecEventArray hecs)
-          traceViewSetHECs traceView hecs
-          traces' <- traceViewGetTraces traceView
-          timelineWindowSetHECs timelineWin (Just hecs)
-          timelineWindowSetTraces timelineWin traces'
-          post (EventSetState mfilename hecs)
+          -- This is a desperate hack to avoid the "segfault on reload" bug
+          -- http://trac.haskell.org/ThreadScope/ticket/1
+          -- It should be enough to let other threads finish and so avoid
+          -- re-entering gtk C code (see ticket for the dirty details)
+          threadDelay 100000 -- 1/10th of a second
+          post (EventSetState hecs mfilename name nevents timespan)
       return ()
+
+    async doing action =
+      forkIO (action `catch` \e -> post (EventUserError doing e))
 
     post = postEvent eventQueue
     continue = continueWith eventlogState
@@ -333,24 +445,25 @@ eventLoop uienv@UIEnv{..} eventlogState = do
 
 -------------------------------------------------------------------------------
 
-runGUI :: FilePath -> String -> Bool -> IO ()
-runGUI filename traceName _debug = do
+runGUI :: Maybe (Either FilePath String) -> IO ()
+runGUI initialTrace = do
   Gtk.initGUI
 
   uiEnv <- constructUI
 
   let post = postEvent (eventQueue uiEnv)
 
-  when (filename /= "") $
-    post (EventFileLoad filename)
+  case initialTrace of
+   Nothing                -> return ()
+   Just (Left  filename)  -> post (EventFileLoad filename)
+   Just (Right traceName) -> post (EventTestLoad traceName)
 
-  -- Likewise for test traces
-  when (traceName /= "") $
-    post (EventTestLoad traceName)
+  doneVar <- newEmptyMVar
 
   forkIO $ do
-    eventLoop uiEnv NoEventlogLoaded
+    res <- try $ eventLoop uiEnv NoEventlogLoaded
     Gtk.mainQuit
+    putMVar doneVar (res :: Either SomeException ())
 
 #ifndef mingw32_HOST_OS
   installHandler sigINT (Catch $ post EventQuit) Nothing
@@ -358,3 +471,7 @@ runGUI filename traceName _debug = do
 
   -- Enter Gtk+ main event loop.
   Gtk.mainGUI
+
+  -- Wait for child event loop to terminate
+  -- This lets us wait for any exceptions.
+  either throwIO return =<< takeMVar doneVar

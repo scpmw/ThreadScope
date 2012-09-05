@@ -33,7 +33,7 @@ data CoreExpr
   | Let [(Bind, Type, CoreExpr)] CoreExpr
   | Case CoreExpr Bind Type [CoreExpr]
   | Alt Cons [Bind] CoreExpr
-  | Abbr CoreExpr
+--  | Abbr CoreExpr
 
 instance Show CoreExpr where
   show = dumpExpr
@@ -93,8 +93,8 @@ readSome get = do
 readCoreLet :: Get (Bind, Type, CoreExpr)
 readCoreLet = (,,) <$> readString  <*> readString <*> readCoreExpr
 
-getCoreExpr :: LBS.ByteString -> CoreExpr
-getCoreExpr str = runGet readCoreExpr str
+getCoreExpr :: BS.ByteString -> CoreExpr
+getCoreExpr str = runGet readCoreExpr $ LBS.fromChunks [str]
 
 -------------------------------------------------------------
 -- Abbreviating

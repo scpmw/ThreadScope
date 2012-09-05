@@ -112,24 +112,25 @@ blockMarker = 18
 
 testEventTypes :: [EventType]
 testEventTypes
-  = [EventType create "Create thread" [] (Just 8),
-     EventType runThread "Run thread" [] (Just 8),
-     EventType stop "Stop thread" [] (Just 10),
-     EventType runnable "Thread runnable" [] (Just 8),
-     EventType migrate "Migrate thread" [] (Just 10),
-     EventType runSpark "Run spark" [] (Just 8),
-     EventType stealSpark "Steal spark" [] (Just 10),
-     EventType shutdown "Shutdown" [] (Just 0),
-     EventType wakeup "Wakeup thread" [] (Just 10),
-     EventType startGC "Start GC" [] (Just 0),
-     EventType finishGC "Finish GC" [] (Just 0),
-     EventType reqSeqGC "Request sequetial GC" [] (Just 0),
-     EventType reqParGC "Reqpargc parallel GC" [] (Just 0),
-     EventType createSparkThread "Create spark thread" [] (Just 8),
-     EventType logMessage "Log message" [] Nothing,
-     EventType startup "Startup" [] (Just 0),
-     EventType blockMarker "Block marker" [] (Just 14)
+  = [eventType create "Create thread" [] (Just 8),
+     eventType runThread "Run thread" [] (Just 8),
+     eventType stop "Stop thread" [] (Just 10),
+     eventType runnable "Thread runnable" [] (Just 8),
+     eventType migrate "Migrate thread" [] (Just 10),
+     eventType runSpark "Run spark" [] (Just 8),
+     eventType stealSpark "Steal spark" [] (Just 10),
+     eventType shutdown "Shutdown" [] (Just 0),
+     eventType wakeup "Wakeup thread" [] (Just 10),
+     eventType startGC "Start GC" [] (Just 0),
+     eventType finishGC "Finish GC" [] (Just 0),
+     eventType reqSeqGC "Request sequetial GC" [] (Just 0),
+     eventType reqParGC "Reqpargc parallel GC" [] (Just 0),
+     eventType createSparkThread "Create spark thread" [] (Just 8),
+     eventType logMessage "Log message" [] Nothing,
+     eventType startup "Startup" [] (Just 0),
+     eventType blockMarker "Block marker" [] (Just 14)
     ]
+  where eventType a b _ c = EventType a b c
 
 -------------------------------------------------------------------------------
 test :: String -> [Event]

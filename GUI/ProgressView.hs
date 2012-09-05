@@ -17,7 +17,6 @@ import qualified Control.Concurrent as Concurrent
 import Control.Exception
 import Data.Typeable
 
-import Prelude hiding (catch)
 
 
 data ProgressView = ProgressView {
@@ -38,7 +37,7 @@ withProgress parent action = do
   let cancel = throwTo self OperationInterrupted
   bracket (new parent cancel) close $ \progress ->
     fmap Just (action progress)
-      `catch` \OperationInterrupted -> return Nothing
+      `Control.Exception.catch` \OperationInterrupted -> return Nothing
 
 data OperationInterrupted = OperationInterrupted
   deriving (Typeable, Show)
@@ -62,7 +61,7 @@ startPulse view = do
         Concurrent.threadDelay 200000
         pulse
   thread <- Concurrent.forkIO $
-              pulse `catch` \OperationInterrupted -> return ()
+              pulse `Control.Exception.catch` \OperationInterrupted -> return ()
   let stop = throwTo thread OperationInterrupted
   waitGUI
   return stop

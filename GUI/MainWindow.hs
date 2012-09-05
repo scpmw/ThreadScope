@@ -2,11 +2,13 @@ module GUI.MainWindow (
     MainWindow,
     mainWindowNew,
     MainWindowActions(..),
+    MainWindowPage(..),
 
     setFileLoaded,
     setStatusMessage,
     sidebarSetVisibility,
     eventsSetVisibility,
+    getCurrentPage,
 
   ) where
 
@@ -22,8 +24,8 @@ import qualified System.Glib.GObject as Glib
 data MainWindow = MainWindow {
        mainWindow         :: Window,
 
-       sidebarBox,
-       eventsBox          :: Widget,
+       sidebarBox         :: Widget,
+       eventsBox          :: Notebook,
 
        statusBar          :: Statusbar,
        statusBarCxt       :: ContextId
@@ -62,8 +64,18 @@ data MainWindowActions = MainWindowActions {
        mainWinJumpZoomFit   :: IO (),
        mainWinScrollLeft    :: IO (),
        mainWinScrollRight   :: IO (),
-       mainWinDisplayLabels :: Bool -> IO ()
+       mainWinDisplayLabels :: Bool -> IO (),
+
+       -- Pane actions
+       mainWinSwitchPage    :: MainWindowPage -> IO ()
      }
+
+data MainWindowPage = PageSummary
+                    | PageStartup
+                    | PageSparks
+                    | PageEvents
+                    | PageSource
+                    deriving (Eq)
 
 -------------------------------------------------------------------------------
 
@@ -103,7 +115,7 @@ mainWindowNew builder actions = do
   statusBar          <- getWidget castToStatusbar "statusbar"
 
   sidebarBox         <- getWidget castToWidget "sidebar"
-  eventsBox          <- getWidget castToWidget "eventsbox"
+  eventsBox          <- getWidget castToNotebook "eventsbox"
 
   bwToggle           <- getWidget castToCheckMenuItem "black_and_white"
   labModeToggle      <- getWidget castToCheckMenuItem "view_labels_mode"
@@ -198,4 +210,22 @@ mainWindowNew builder actions = do
   onToolButtonClicked zoomOutButton $ mainWinJumpZoomOut actions
   onToolButtonClicked zoomFitButton $ mainWinJumpZoomFit actions
 
+  -- Pane
+  on eventsBox switchPage $ mainWinSwitchPage actions . pageNoToPage
+
   return MainWindow {..}
+
+getCurrentPage :: MainWindow -> IO MainWindowPage
+getCurrentPage MainWindow{eventsBox}
+  = fmap pageNoToPage $ notebookGetCurrentPage eventsBox
+
+-- Note: This isn't stable against page reordering. Might be better
+-- to use notebookGetNthPageSource in future and check it against
+-- the Widget names from the glade file.
+pageNoToPage :: Int -> MainWindowPage
+pageNoToPage 0 = PageSummary
+pageNoToPage 1 = PageStartup
+pageNoToPage 2 = PageSparks
+pageNoToPage 3 = PageEvents
+pageNoToPage 4 = PageSource
+pageNoToPage _ = error "pageNoToPage: Unknown page number!"

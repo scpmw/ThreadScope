@@ -7,14 +7,12 @@ import System.Glib.GError (failOnGError)
 
 -- Imports from Haskell library
 import Text.Printf
-import Control.Monad
 #ifndef mingw32_HOST_OS
 import System.Posix
 #endif
 import Control.Concurrent
 import qualified Control.Concurrent.Chan as Chan
 import Control.Exception
-import Prelude hiding (catch)
 import Data.Array
 import Data.Maybe
 
@@ -24,6 +22,7 @@ import Paths_threadscope
 import qualified GUI.MainWindow as MainWindow
 import GUI.Types
 import Events.HECs hiding (Event)
+import Events.Debug
 import GUI.Dialogs
 import Events.ReadEvents
 import GUI.EventsView
@@ -65,7 +64,8 @@ data EventlogState
        mfilename :: Maybe FilePath, --test traces have no filepath
        hecs      :: HECs,
        selection :: TimeSelection,
-       cursorPos :: Int
+       cursorPos :: Int,
+       currentPages :: [MainWindow.MainWindowPage] -- pages that don't need to be refreshed
      }
 
 postEvent :: Chan Event -> Event -> IO ()
@@ -88,7 +88,7 @@ data Event
    | EventFileExport FilePath FileExportFormat
 
 -- | EventStateClear
-   | EventSetState HECs (Maybe FilePath) String Int Double
+   | EventSetState HECs DebugMaps (Maybe FilePath) String Int Double
 
    | EventShowSidebar Bool
    | EventShowEvents  Bool
@@ -104,6 +104,8 @@ data Event
    | EventTimelineLabelsMode Bool
    | EventTimelineShowBW     Bool
 
+   | EventSwitchPage MainWindow.MainWindowPage
+
    | EventCursorChangedIndex     Int
    | EventCursorChangedSelection TimeSelection
 
@@ -116,8 +118,8 @@ data Event
    | EventUserError String SomeException
                     -- can add more specific ones if necessary
 
-constructUI :: IO UIEnv
-constructUI = failOnGError $ do
+constructUI :: Options -> IO UIEnv
+constructUI opts = failOnGError $ do
 
   builder <- Gtk.builderNew
   Gtk.builderAddFromFile builder =<< getDataFileName "threadscope.ui"
@@ -144,7 +146,8 @@ constructUI = failOnGError $ do
     mainWinJumpZoomOut   = post EventTimelineZoomOut,
     mainWinJumpZoomFit   = post EventTimelineZoomToFit,
     mainWinDisplayLabels = post . EventTimelineLabelsMode,
-    mainWinViewBW        = post . EventTimelineShowBW
+    mainWinViewBW        = post . EventTimelineShowBW,
+    mainWinSwitchPage    = post . EventSwitchPage
   }
 
   timelineWin <- timelineViewNew builder TimelineViewActions {
@@ -164,8 +167,7 @@ constructUI = failOnGError $ do
     traceViewTracesChanged = post . EventTracesChanged
   }
 
-  sourceView <- sourceViewNew builder SourceViewActions {
-  }
+  sourceView <- sourceViewNew builder opts SourceViewActions {}
 
   bookmarkView <- bookmarkViewNew builder BookmarkViewActions {
     bookmarkViewAddBookmark    = post EventBookmarkAdd,
@@ -193,7 +195,7 @@ eventLoop uienv@UIEnv{..} eventlogState = do
     next  <- dispatch event eventlogState
 #if __GLASGOW_HASKELL__ <= 612
                -- workaround for a wierd exception handling bug in ghc-6.12
-               `catch` \e -> throwIO (e :: SomeException)
+               `Control.Exception.catch` \e -> throwIO (e :: SomeException)
 #endif
     case next of
       Left  LoopDone       -> return ()
@@ -232,7 +234,7 @@ eventLoop uienv@UIEnv{..} eventlogState = do
 
 --    dispatch EventClearState _
 
-    dispatch (EventSetState hecs mfilename name nevents timespan) _ = do
+    dispatch (EventSetState hecs dbgMap mfilename name nevents timespan) _ = do
 
       MainWindow.setFileLoaded mainWin (Just name)
       MainWindow.setStatusMessage mainWin $
@@ -240,7 +242,7 @@ eventLoop uienv@UIEnv{..} eventlogState = do
 
       let mevents = Just $ hecEventArray hecs
       eventsViewSetEvents eventsView mevents
-      sourceViewSetEvents sourceView mfilename (Just $ hecEventArray hecs)
+      sourceViewSetEvents sourceView mfilename (Just (hecEventArray hecs, dbgMap))
       startupInfoViewSetEvents startupView mevents
       summaryViewSetEvents summaryView mevents
       histogramViewSetHECs histogramView (Just hecs)
@@ -267,6 +269,7 @@ eventLoop uienv@UIEnv{..} eventlogState = do
           , hecs      = hecs
           , selection = PointSelection 0
           , cursorPos = 0
+          , currentPages = []
           }
 
     dispatch EventExportDialog
@@ -354,40 +357,29 @@ eventLoop uienv@UIEnv{..} eventlogState = do
 
     dispatch (EventCursorChangedIndex cursorPos') EventlogLoaded{hecs} = do
       let cursorTs'  = eventIndexToTimestamp hecs cursorPos'
-          selection' = PointSelection cursorTs'
-      timelineSetSelection timelineWin selection'
-      eventsViewSetCursor eventsView  cursorPos' Nothing
-      sourceViewSetCursor sourceView  cursorPos'
-      continueWith eventlogState {
-        selection = selection',
+      refreshView eventlogState {
+        selection = PointSelection cursorTs',
         cursorPos = cursorPos'
-      }
+        }
 
     dispatch (EventCursorChangedSelection selection'@(PointSelection cursorTs'))
-             EventlogLoaded{hecs} = do
-      let cursorPos' = timestampToEventIndex hecs cursorTs'
-      timelineSetSelection timelineWin selection'
-      eventsViewSetCursor eventsView cursorPos' Nothing
-      sourceViewSetCursor sourceView cursorPos'
-      histogramViewSetInterval histogramView Nothing
-      summaryViewSetInterval summaryView Nothing
-      continueWith eventlogState {
+             eventLogState@EventlogLoaded{hecs} = do
+      let cursorPos' = timestampToEventIndex (hecEventArray hecs) cursorTs'
+      refreshView eventLogState {
         selection = selection',
         cursorPos = cursorPos'
-      }
+        }
 
-    dispatch (EventCursorChangedSelection selection'@(RangeSelection start end))
-             EventlogLoaded{hecs} = do
-      let cursorPos' = timestampToEventIndex hecs start
-          mrange = Just (cursorPos', timestampToEventIndex hecs end)
-      timelineSetSelection timelineWin selection'
-      eventsViewSetCursor eventsView cursorPos' mrange
-      histogramViewSetInterval histogramView (Just (start, end))
-      summaryViewSetInterval summaryView (Just (start, end))
-      continueWith eventlogState {
+    dispatch (EventCursorChangedSelection selection'@(RangeSelection start _))
+             eventLogState@EventlogLoaded{hecs} = do
+      let cursorPos' = timestampToEventIndex (hecEventArray hecs) start
+      refreshView eventLogState {
         selection = selection',
         cursorPos = cursorPos'
-      }
+        }
+
+    dispatch (EventSwitchPage page) eventlogState =
+      refreshPage page eventlogState
 
     dispatch (EventTracesChanged traces) _ = do
       timelineWindowSetTraces timelineWin traces
@@ -428,16 +420,59 @@ eventLoop uienv@UIEnv{..} eventlogState = do
       ConcurrencyControl.fullSpeed concCtl $
         ProgressView.withProgress mainWin $ \progress -> do
           (hecs, name, nevents, timespan) <- registerEvents progress
+          (dbgMap, events') <- buildDebugMaps (hecEventArray hecs) (ProgressView.setText progress)
           -- This is a desperate hack to avoid the "segfault on reload" bug
           -- http://trac.haskell.org/ThreadScope/ticket/1
           -- It should be enough to let other threads finish and so avoid
           -- re-entering gtk C code (see ticket for the dirty details)
           threadDelay 100000 -- 1/10th of a second
-          post (EventSetState hecs mfilename name nevents timespan)
+          post (EventSetState hecs dbgMap mfilename name nevents timespan)
       return ()
 
     async doing action =
-      forkIO (action `catch` \e -> post (EventUserError doing e))
+      forkIO (action `Control.Exception.catch` \e -> post (EventUserError doing e))
+
+    refreshView eventlogState@EventlogLoaded{..} = do
+      timelineSetSelection timelineWin selection
+
+      -- Refresh active page, invalidate all others
+      activePage <- MainWindow.getCurrentPage mainWin
+      mapM_ invalidatePage (filter (/= activePage) currentPages)
+      refreshPage activePage eventlogState{ currentPages = [] }
+    refreshView eventlogState = continueWith eventlogState
+
+    invalidatePage :: MainWindow.MainWindowPage -> IO ()
+    invalidatePage MainWindow.PageSource = sourceViewClear sourceView
+    invalidatePage _                     = return ()
+
+    refreshPage page eventlogState@EventlogLoaded{..}
+      | page `elem` currentPages  = continueWith eventlogState
+      | otherwise                 = do
+          -- Interval needs adjustment?
+          selection' <- case page of
+            MainWindow.PageSource -> sourceViewAdjustSelection sourceView selection
+            _                     -> return Nothing
+          case selection' of
+            Just sel' -> do post (EventCursorChangedSelection sel')
+                            continueWith eventlogState
+            Nothing   -> do
+              let mrange = case selection of
+                    PointSelection _     -> Nothing
+                    RangeSelection _ end -> Just (cursorPos,
+                                                  timestampToEventIndex (hecEventArray hecs) end)
+                  interval = case selection of
+                    PointSelection _         -> Nothing
+                    RangeSelection start end -> Just (start, end)
+              case page of
+                MainWindow.PageSummary -> summaryViewSetInterval summaryView interval
+                MainWindow.PageStartup -> return ()
+                MainWindow.PageSparks  -> histogramViewSetInterval histogramView interval
+                MainWindow.PageEvents  -> eventsViewSetCursor eventsView cursorPos mrange
+                MainWindow.PageSource  -> sourceViewSetSelection sourceView selection
+              continueWith eventlogState {
+                currentPages = page:currentPages
+                }
+    refreshPage _  eventlogState = continueWith eventlogState
 
     post = postEvent eventQueue
     continue = continueWith eventlogState
@@ -445,11 +480,11 @@ eventLoop uienv@UIEnv{..} eventlogState = do
 
 -------------------------------------------------------------------------------
 
-runGUI :: Maybe (Either FilePath String) -> IO ()
-runGUI initialTrace = do
+runGUI :: Maybe (Either FilePath String) -> Options -> IO ()
+runGUI initialTrace opts = do
   Gtk.initGUI
 
-  uiEnv <- constructUI
+  uiEnv <- constructUI opts
 
   let post = postEvent (eventQueue uiEnv)
 

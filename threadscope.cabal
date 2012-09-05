@@ -40,11 +40,11 @@ source-repository head
 
 Executable threadscope
   Main-is:           Main.hs
-  Build-Depends:     base >= 4.0 && < 5,
-                     gtk >= 0.12, cairo, glib, pango,
+  Build-Depends:     base >= 4.0,
+                     gtk >= 0.12, cairo, glib, pango, gtksourceview2, transformers,
                      binary, array, mtl, filepath,
-                     ghc-events == 0.4.*,
-                     containers >= 0.2 && < 0.5, pretty,
+                     ghc-events-pmw == 0.4.*,
+                     containers >= 0.2, pretty,
                      directory, bytestring,
                      deepseq >= 1.1,
                      time >= 1.1
@@ -57,6 +57,7 @@ Executable threadscope
                      Events.SparkTree,
                      Events.TestEvents,
                      Events.Core,
+                     Events.Debug,
                      GUI.Main,
                      GUI.MainWindow,
                      GUI.EventsView,
@@ -95,4 +96,4 @@ Executable threadscope
      ghc-options:  -fno-warn-unused-matches
 
   if !os(windows)
-     build-depends: unix >= 2.3 && < 2.6
+     build-depends: unix >= 2.3 && < 2.7

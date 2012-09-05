@@ -179,7 +179,10 @@ emptyGenStat = GenStat
   }
 
 scanEvents :: SummaryData -> CapEvent -> SummaryData
-scanEvents !summaryData (CapEvent mcap ev) =
+scanEvents !summaryData (CapEvent mcap ev) = emptySummaryData
+{-- PMW - this seems to be a massive resource hog and prone to
+          crashing. I'm keeping it commented out for now, no offense.
+
   let -- For events that contain a counter with a running sum.
       -- Eventually we'll subtract the last found
       -- event from the first. Intervals beginning at time 0
@@ -382,6 +385,7 @@ scanEvents !summaryData (CapEvent mcap ev) =
                       IM.alter (alterCounter current) cap dsparkTable }
           _ -> sd
     in scan (fromJust mcap) summaryData ev
+--}
 
 ppWithCommas :: Word64 -> String
 ppWithCommas =

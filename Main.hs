@@ -1,6 +1,7 @@
 module Main where
 
 import GUI.Main (runGUI)
+import GUI.Types (Options(..), defaultOptions)
 
 import System.Environment
 import System.Exit
@@ -28,7 +29,7 @@ handleArgs flags args
       ([], Nothing)         -> return Nothing
       _                     -> printUsage >> exitFailure
 
-    runGUI initialTrace
+    runGUI initialTrace (flagOptions flags)
 
   where
     printVersion = putStrLn ("ThreadScope version " ++ showVersion version)
@@ -45,11 +46,12 @@ handleArgs flags args
 data Flags = Flags {
      flagTest    :: Maybe FilePath,
      flagVersion :: Bool,
-     flagHelp    :: Bool
+     flagHelp    :: Bool,
+     flagOptions :: Options
   }
 
 defaultFlags :: Flags
-defaultFlags = Flags Nothing False False
+defaultFlags = Flags Nothing False False defaultOptions
 
 flagDescrs :: [OptDescr (Flags -> Flags)]
 flagDescrs =
@@ -64,6 +66,13 @@ flagDescrs =
   , Option ['t'] ["test"]
       (ReqArg (\name flags -> flags { flagTest = Just name }) "NAME")
       "Load a named internal test (see Events/TestEvents.hs)"
+
+  , Option ['d'] ["directory"]
+      (ReqArg (\name flags -> flags { flagOptions = (flagOptions flags) {
+                                         optSearchPaths = name : optSearchPaths (flagOptions flags)}}
+              ) "NAME")
+      "Add a directory to search for source files"
+
   ]
 
 parseArgs :: [String] -> IO (Flags, [String])

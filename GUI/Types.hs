@@ -1,4 +1,5 @@
 module GUI.Types (
+    Options(..), defaultOptions,
     ViewParameters(..),
     Trace(..),
     Timestamp,
@@ -8,6 +9,15 @@ module GUI.Types (
 import GHC.RTS.Events
 
 -----------------------------------------------------------------------------
+
+data Options = Options {
+  optSearchPaths :: [FilePath]
+  }
+
+defaultOptions :: Options
+defaultOptions = Options {
+  optSearchPaths = []
+  }
 
 data Trace
   = TraceHEC      Int

@@ -41,8 +41,8 @@ eventIndexToTimestamp :: HECs -> Int -> Timestamp
 eventIndexToTimestamp HECs{hecEventArray=arr} n =
   time (ce_event (arr ! n))
 
-timestampToEventIndex :: HECs -> Timestamp -> Int
-timestampToEventIndex HECs{hecEventArray=arr} ts =
+timestampToEventIndex :: Array Int CapEvent -> Timestamp -> Int
+timestampToEventIndex arr ts =
     search l (r+1)
   where
     (l,r) = bounds arr

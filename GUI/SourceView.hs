@@ -56,8 +56,6 @@ import Text.Printf
 
 import Paths_threadscope (getDataFileName)
 
-import Debug.Trace
-
 -------------------------------------------------------------------------------
 
 data FileView = FileView {
@@ -123,6 +121,7 @@ data Tag = Tag {
   tagEntry :: Tag
   }
 
+
 data SourceTag = SourceTag {
   stagFile :: String,
   stagName :: String,
@@ -139,7 +138,10 @@ instance Ord Tag where
     (m1 `compare` m2) `mappend` (n1 `compare` n2) `mappend` (t1 `compare` t2)
 
 instance NFData Tag where
-  rnf Tag{..} = tagUnit `deepseq` tagName `deepseq` tagTick `deepseq` tagDebug `seq` ()
+  rnf Tag{..} = tagUnit `deepseq`
+                tagName `deepseq`
+                tagTick `deepseq`
+                tagDebug `seq` ()
 
 initViewState :: SourceViewState
 initViewState = SourceViewState {
@@ -298,8 +300,8 @@ sourceViewNew builder opts SourceViewActions{..} = do
     ]
 
   -- Create columns for source tag tree
-  srcTagsTreeView <- getWidget castToTreeView "source_tagstree1"
-  srcTagsStore    <- treeStoreNew []
+  srcTagsTreeView  <- getWidget castToTreeView "source_tagstree1"
+  srcTagsStore     <- treeStoreNew []
 
   srcTagFreqRender <- cellRendererProgressNew
   srcTagFreqCol    <- mkColumn srcTagsTreeView srcTagFreqRender "%"
@@ -395,7 +397,7 @@ sourceViewNew builder opts SourceViewActions{..} = do
       (pre,(ts:_)) | Just (pbuf, pbuf2) <- Map.lookup ts structBufMap ->
         set structRenderer [ cellPixbuf := case ts of
                                 (t:_) | any (elem t) pre -> pbuf
-                                _                        -> pbuf2 
+                                _                        -> pbuf2
                            ]
       _ -> return ()
 
@@ -653,23 +655,12 @@ sourceViewSetSelection view@SourceView{..} timeSel = do
   -- Update source tag selection
   let srcSel' = srcSel >>= (\s -> find (sourceTagEquiv s) sourceTags')
 
-  {-
-  forM_ sourceTags' $ \SourceTag{..} -> do
-    putStrLn $ printf "** %02.2f %s:%s" (100 * stagFreq) stagFile stagName
-    mapM_ dumpTag stagTags
-  -}
-
   -- Set new state
   tags' `deepseq`
     writeIORef stateRef state{
       tags=tags', sourceTags=sourceTags', fileTags=fileTags',
       selection=selection', srcSel=srcSel', hintSel=stagTags srcSel'
       }
-
-  putStrLn " === done"
-
-  putStrLn " * Current tags:"
-  mapM_ dumpTag tags'
 
   -- Update views
   postGUIAsync (updateViews view)
@@ -810,8 +801,9 @@ updateSrcTagSelection view@SourceView{..} = do
 
       -- Scroll to function
       -- Note: We are creating a mark here, as scrolling to an
-      -- iterator position is not reiable with freshly opened text
+      -- iterator position is not reliable with freshly opened text
       -- buffers.
+      -- Note 2: This still doesn't work, in fact
       case stagSources stag of
         (span:_) -> do
           let buf = sourceBuffer fileView

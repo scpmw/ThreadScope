@@ -31,10 +31,10 @@ import Graphics.Rendering.Cairo
 import Data.Array
 import qualified Data.Array.Unboxed as UA
 import qualified Data.ByteString as BS
-import Data.Char (chr, isSpace)
+import Data.Char (chr, ord, isSpace, isAlphaNum)
 import qualified Data.Function as F
 import Data.IORef
-import qualified Data.Map.Strict as Map
+import qualified Data.Map as Map
 import Data.Maybe (mapMaybe, fromMaybe)
 import Data.Monoid (mappend)
 import Data.List
@@ -351,6 +351,28 @@ sourceViewNew builder opts SourceViewActions{..} = do
     updateFileView srcView
   after coreView sourceViewLineMarkActivated $ \pos ->
     liftIO $ activateMark srcView coreBuffer pos
+
+  -- Set up tooltip. queryTooltip doesn't seem to work, so
+  -- we use some lame hack using selection.
+  set coreView [ widgetHasTooltip := True
+               , widgetTooltipText := Just "Test"
+               ]
+  let updateTooltip = do
+
+        -- get gutter width
+        costRenderWdt <- get costRenderer cellWidth
+        structRenderWdt <- get structRenderer cellWidth
+        let totalWdt = costRenderWdt + structRenderWdt + 20
+
+        -- get iter at position
+        (x,y) <- widgetGetPointer coreView
+        (bx,by) <- textViewWindowToBufferCoords coreView TextWindowText
+                   (x-totalWdt, y)
+        iter <- textViewGetIterAtLocation coreView bx by
+        -- backward to word start, forward to word end
+        updateCoreTooltip srcView iter
+        return True
+  timeoutAdd updateTooltip 1000
 
   sourceGutterSetCellDataFunc coreGutter costRenderer $ \_cell l _ -> do
     SourceViewState{lineTags} <- readIORef stateRef
@@ -1802,3 +1824,62 @@ lineTagClr SourceView{stateRef,coreView} tag bg = do
                 (round $ m * fromIntegral g1 + (1-m) * fromIntegral g2)
                 (round $ m * fromIntegral b1 + (1-m) * fromIntegral b2)
   return $ mix m lColor bgColor
+
+
+updateCoreTooltip :: SourceView -> TextIter -> IO ()
+updateCoreTooltip SourceView{stateRef,coreView} iter = do
+
+  -- Clear the tooltip
+  set coreView [ widgetHasTooltip := False
+               ]
+
+  -- get identifier at location
+  let isIdent '_'  = True
+      isIdent '\'' = True
+      isIdent '$'  = True
+      isIdent '#'  = True
+      isIdent x    = isAlphaNum x
+
+      searchIdentStart iter = do
+        wentBack <- textIterBackwardChar iter
+        if not wentBack then return () else do
+          haveIdent <- fmap (fmap isIdent) $ textIterGetChar iter
+          case haveIdent of
+            Just True -> searchIdentStart iter
+            _other    -> textIterForwardChar iter >> return ()
+      searchIdentEnd iter = do
+        wentFwd <- textIterForwardChar iter
+        if not wentFwd then return () else do
+          haveIdent <- fmap (fmap isIdent) $ textIterGetChar iter
+          case haveIdent of
+            Just True -> searchIdentEnd iter
+            _other    -> return ()
+
+  searchIdentStart iter
+  iterCopy <- textIterCopy iter
+  searchIdentEnd iterCopy
+
+  ident <- textIterGetSlice iter iterCopy
+
+  -- Get line tag
+  SourceViewState{lineTags} <- readIORef stateRef
+  line <- textIterGetLine iter
+  case drop line lineTags of
+    ((tag:_):_) -> do
+
+      -- Find type
+      let identBS =strToBS ident
+          mtyp = findDbgElem ((getBindType identBS . dbgCoreCode =<<) . dbgDCore)
+                 (tagDebug tag)
+      case mtyp of
+        Just typ -> do
+          set coreView
+            [ widgetHasTooltip := False
+            , widgetTooltipText := Just $ bsToStr typ
+            ]
+        Nothing -> return ()
+
+    _other -> return ()
+
+strToBS :: String -> BS.ByteString
+strToBS = BS.pack . map (fromIntegral.ord)

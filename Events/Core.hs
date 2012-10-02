@@ -2,7 +2,7 @@
 module Events.Core (
   getCoreExpr,
   CoreExpr(..),
-  renderExpr, dumpExpr
+  renderExpr, dumpExpr, getBindType,
   ) where
 
 import qualified Data.ByteString as BS
@@ -29,10 +29,10 @@ data CoreExpr
   = Misc BS.ByteString
   | App CoreExpr CoreExpr
   | Ref Bind Cons
-  | Lam Bind CoreExpr
+  | Lam Bind Type CoreExpr
   | Let [(Bind, Type, CoreExpr)] CoreExpr
   | Case CoreExpr Bind Type [CoreExpr]
-  | Alt Cons [Bind] CoreExpr
+  | Alt Cons [(Bind, Type)] CoreExpr
 --  | Abbr CoreExpr
 
 instance Show CoreExpr where
@@ -53,8 +53,8 @@ collectBinders :: CoreExpr -> ([Bind], CoreExpr)
 collectBinders expr
   = go [] expr
   where
-    go bs (Lam b e) = go (b:bs) e
-    go bs e         = (reverse bs, e)
+    go bs (Lam b _ e) = go (b:bs) e
+    go bs e           = (reverse bs, e)
 collectArgs :: CoreExpr -> (CoreExpr, [CoreExpr])
 collectArgs expr
   = go expr []
@@ -75,11 +75,12 @@ readCoreExpr = getWord8 >>= \c ->
     _ | c == coreMisc -> Misc <$> readString
       | c == coreApp  -> App  <$> readCoreExpr <*> readCoreExpr
       | c == coreRef  -> Ref  <$> readString <*> readString
-      | c == coreLam  -> Lam  <$> readString <*> readCoreExpr
+      | c == coreLam  -> Lam  <$> readString <*> readString <*> readCoreExpr
       | c == coreLet  -> Let  <$> readSome readCoreLet <*> readCoreExpr
       | c == coreCase -> Case <$> readCoreExpr <*> readString <*> readString
                               <*> readSome readCoreExpr
-      | c == coreAlt  -> Alt  <$> readString <*> readSome readString
+      | c == coreAlt  -> Alt  <$> readString <*> readSome (
+                                    (,) <$> readString <*> readString)
                               <*> readCoreExpr
       | otherwise     -> fail ("invalid core id: " ++ show c)
 
@@ -137,7 +138,7 @@ ppr p (e@Lam{}) =
 ppr p (Case expr bind _ [Alt con args rhs]) =
   p $ sep [sep [text "case" <+> ppr id expr,
                 sep [text "of" <+> pprBS bind,
-                     lbrace <+> pprPat con args <+> text "->"]
+                     lbrace <+> pprPat con (map fst args) <+> text "->"]
                ]
           , ppr id rhs <+> rbrace ]
 ppr p (Case expr bind _ alts) =
@@ -156,7 +157,7 @@ ppr p (Let binds expr) =
           , ppr id expr ]
 ppr _ (Ref bind cons) = ptext (placeholder bind cons)
 ppr _ (Alt cons binds expr)
-  = hang (pprPat cons binds <+> text "->") 2 (ppr id expr)
+  = hang (pprPat cons (map fst binds) <+> text "->") 2 (ppr id expr)
 
 -- | Pretty-print multi-line text
 mltext :: String -> Doc
@@ -235,3 +236,24 @@ dumpExpr :: CoreExpr -> String
 dumpExpr = renderExpr (lineLength PP.style) 0 printer ""
  where printer (Left  s) ss = s ++ ss
        printer (Right _) ss = "#ref#" ++ ss
+
+getBindType :: Bind -> CoreExpr -> Maybe Type
+getBindType b (App e1 e2)       = getBindType b e1 <|> getBindType b e2
+getBindType b (Lam b' t e)
+  | b == b'                     = Just t
+  | otherwise                   = getBindType b e
+getBindType b (Let bs e)        = foldr (<|>) (getBindType b e) $
+                                  map (getBindTypeLet b) bs
+getBindType b (Case e b' t alts)
+  | b == b'                     = Just t
+  | otherwise                   = foldr (<|>) (getBindType b e) $
+                                  map (getBindType b) alts
+getBindType b (Alt _ binds e)
+  | Just ty <- lookup b binds   = Just ty
+  | otherwise                   = getBindType b e
+getBindType _ _                 = Nothing
+
+getBindTypeLet :: Bind -> (Bind, Type, CoreExpr) -> Maybe Type
+getBindTypeLet b (b', t, _) | b == b'  = Just t
+getBindTypeLet b (_,  _, e)            = getBindType b e
+

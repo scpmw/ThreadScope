@@ -1161,9 +1161,12 @@ weightedSamplesByInterval sampleType eventsArr rangeMap interval = weighted
   where samples    = samplesByInterval sampleType eventsArr interval
         samples'   = concatMap snd samples
         resolved   = lookupRanges rangeMap samples'
-        baseWeight = 1 / fromIntegral (sum $ map fst resolved)
+        findAlc (n,d) = (n, fmap (findAllocationEntry rangeMap) d)
+        corrected  | sampleType == SampleByHeap  = map findAlc resolved
+                   | otherwise                   = resolved
+        baseWeight = 1 / fromIntegral (sum $ map fst corrected)
         weightCycle (n, dbg) = (fromIntegral n * baseWeight, dbg)
-        weighted = map weightCycle resolved
+        weighted = map weightCycle corrected
 
 {--
 weightedMixedSamplesByInterval :: EventsArray -> DebugMaps -> (Timestamp, Timestamp)

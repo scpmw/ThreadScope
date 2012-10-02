@@ -10,7 +10,7 @@ module Events.Debug (
 
   lookupRange, lookupRanges,
 
-  lookupCore,
+  lookupCore, findAllocationEntry
 
   ) where
 
@@ -160,7 +160,7 @@ buildDbgMap arr = dbgMap
                                    , dbgSources = srcs
                                    , dbgDCore = core
                                    }
-               iMapO' = case instr of
+               !iMapO' = case instr of
                  Just ix -> IM.insert (fI ix) entry iMapO
                  Nothing -> iMapO
            in go mfile moff (i+1) iMapI iMapO' es (entry:xs)
@@ -294,6 +294,25 @@ buildCoreMap = Map.fromList . mapMaybe coreData
 lookupCore :: DebugMaps -> String -> String -> String -> Maybe DebugEntry
 lookupCore DebugMaps{coreMap=coreMap} unit bind cons
   = Map.lookup (strToBS unit, strToBS bind, strToBS cons) coreMap
+
+findAllocationEntry :: DebugMaps -> DebugEntry -> DebugEntry
+findAllocationEntry maps dbg =
+  case fmap (findAllocation . dbgCoreCode) (dbgDCore dbg) of
+    Just (Binds bs)
+      | [child] <- filter (not . checkNoAlloc maps) (mapMaybe findBind bs)
+           -> findAllocationEntry maps child
+    _other -> dbg
+ where findBind (b, c) = Map.lookup (dbgUnit dbg, b, c) (coreMap maps)
+
+checkNoAlloc :: DebugMaps -> DebugEntry -> Bool
+checkNoAlloc maps dbg =
+  case fmap (findAllocation . dbgCoreCode) (dbgDCore dbg) of
+    Just (Binds bs)
+      | all (checkNoAlloc maps) $ mapMaybe findBind bs
+                 -> True
+    Just NoAlloc -> True
+    _other       -> False
+ where findBind (b, c) = Map.lookup (dbgUnit dbg, b, c) (coreMap maps) 
 
 -------------------------------------------------------------------------------
 

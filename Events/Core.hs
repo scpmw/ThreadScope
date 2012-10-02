@@ -3,6 +3,7 @@ module Events.Core (
   getCoreExpr,
   CoreExpr(..),
   renderExpr, dumpExpr, getBindType,
+  findAllocation, AllocResult(..)
   ) where
 
 import qualified Data.ByteString as BS
@@ -257,3 +258,30 @@ getBindTypeLet :: Bind -> (Bind, Type, CoreExpr) -> Maybe Type
 getBindTypeLet b (b', t, _) | b == b'  = Just t
 getBindTypeLet b (_,  _, e)            = getBindType b e
 
+------------------
+
+data AllocResult
+     = NoAlloc
+     | Alloc
+     | Mixed
+     | Binds [(BS.ByteString, BS.ByteString)]
+
+findAllocation :: CoreExpr -> AllocResult
+findAllocation (Misc {})   = NoAlloc
+findAllocation (App e1 _)  = findAllocation e1
+findAllocation (Ref b c)   = Binds [(b,c)]
+findAllocation (Lam {})    = Alloc
+findAllocation (Let _ e)   = combineAlc Alloc (findAllocation e)
+findAllocation (Case e _ _ es) = foldr combineAlc NoAlloc $
+                                 map findAllocation (e:es)
+findAllocation (Alt _ _ e) = findAllocation e
+
+combineAlc :: AllocResult -> AllocResult -> AllocResult
+combineAlc Mixed      _          = Mixed
+combineAlc _          Mixed      = Mixed
+combineAlc NoAlloc    a          = a
+combineAlc a          NoAlloc    = a
+combineAlc Alloc      Alloc      = Alloc
+combineAlc Alloc      (Binds _)  = Mixed
+combineAlc (Binds _)  Alloc      = Mixed
+combineAlc (Binds b1) (Binds b2) = Binds (b1 ++ b2)

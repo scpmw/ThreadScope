@@ -310,7 +310,6 @@ sourceViewNew builder opts SourceViewActions{..} = do
   srcTagNameRender <- cellRendererTextNew
   srcTagNameCol    <- mkColumn srcTagsTreeView srcTagNameRender "Name"
 
-
 -- updateSourceTagsActivation :: TreeStore (SourceTag, Bool) -> SourceTag -> IO ()
 -- updateSourceTagsActivation tagsStore tag = do
 --   treeModelForeach tagsStore $ \i -> do
@@ -601,8 +600,6 @@ sourceViewAdjustSelection SourceView{..} (PointSelection sel) = do
   -- We can't really work with a point selection, so let's "enhance"
   -- the selection until we have a "good" amount of samples
   let goodAmountOfSamples = 100
-
-  putStrLn $ "Doing stuff..."
 
   SourceViewState{eventsArr} <- readIORef stateRef
   let countSamples CapEvent{ce_event=Event{spec=InstrPtrSample{ips}}}
@@ -1195,7 +1192,7 @@ tagsByInterval eventsArr rangeMap interval =
 
       ord = compare `F.on` (fmap dbgId . tagDebug)
       t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }
-  in trace ("GrandSum: " ++ show grandSum) $ nubSumBy ord plus tags
+  in nubSumBy ord plus tags
 
 
 -------------------------------------------------------------------------------
@@ -1371,7 +1368,7 @@ showCore sview@SourceView{coreBuffer,stateRef} tag = do
 
 -- | Writes top-level core, including an "up" link if appropriate
 printTopLevel :: SourceView -> TextIter -> String -> Maybe DebugEntry -> [Tag] -> CoreExpr -> IO ()
-printTopLevel sview iter unit dbg ltags core 
+printTopLevel sview iter unit dbg ltags core
   = case findDbgElem dbgDCore (dbgParent =<< dbg) of
       Just parent -> do
         let parent_bind = (bsToStr $ dbgCoreBind parent,
@@ -1670,7 +1667,7 @@ getSubsumationEntry entry = case dbgParent entry of
 -- | For the lack of a better name - find direct parent/child pairs
 -- and merge them
 subsumeTagFamilies :: [Tag] -> [Tag]
-subsumeTagFamilies tags = trace (show $ length dbgs) $ subsumeTags $ map moveToParent tags
+subsumeTagFamilies tags = subsumeTags $ map moveToParent tags
  where
   dbgs = mapMaybe tagDebug tags
   moveToParent t
@@ -1731,7 +1728,7 @@ subsumeSrcTags filesOnly = map mergeSources . nubSumBy cmpSpan plus
           | spanEnd s1 >= spanEnd s2
             = merge (s1:ss2)
           | otherwise
-            = let s1' = s1 { endLine = endLine s2, endCol = endCol s2 } 
+            = let s1' = s1 { endLine = endLine s2, endCol = endCol s2 }
               in merge (s1':ss2)
         merge ss = ss
 

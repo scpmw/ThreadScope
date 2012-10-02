@@ -98,6 +98,7 @@ data SourceViewState
     selection  :: Maybe Tag,
     srcSel     :: Maybe SourceTag,
     hintSel    :: [Tag],
+    openEntries:: [DebugEntry],
     files      :: [FileView],
     searchDirs :: [FilePath],
     lineTags   :: [[Tag]],
@@ -156,6 +157,7 @@ initViewState = SourceViewState {
   files = [],
   searchDirs = [],
   lineTags = [],
+  openEntries = [],
   structBufMap = Map.empty
   }
 
@@ -433,21 +435,16 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
 
       -- Search dirs
       curDir <- getCurrentDirectory
-      searchDirs <- nub <$> mapM canonicalizePath (globalSearchDirs ++ [takeDirectory file, curDir])
+      searchDirs <- nub <$> mapM canonicalizePath (
+        globalSearchDirs ++ [takeDirectory file, curDir])
 
-      -- Find initial tags
-      let tags = --tagsFromLocalTicks 0 eventsArr dbgMap ++
-                 tagsFromLocalIPs2 0 eventsArr dbgMap
-          selection = Nothing
-          srcSel = Nothing
-          hintSel = []
-
-      let files = []
-          lineTags = []
-          sourceTags = []
-          fileTags = []
-          structBufMap = Map.empty
-      return SourceViewState {..}
+      -- Set initial tags
+      return initViewState {
+        eventsArr = eventsArr,
+        dbgMap = dbgMap,
+        tags = tagsFromLocalIPs2 0 eventsArr dbgMap,
+        searchDirs = searchDirs
+        }
 
     _other -> return initViewState
 
@@ -801,6 +798,8 @@ updateSrcTagSelection view@SourceView{..} = do
   writeIORef stateRef state {
     srcSel = select',
     hintSel = maybe [] stagTags select',
+    openEntries = nub . map getSubsumationEntry .
+                  mapMaybe tagDebug $ maybe [] stagTags select'
     }
 
   case select' of
@@ -1468,11 +1467,7 @@ corePrinter sview iter unit ltags (Right (bind, cons)) cont = do
 
   -- Lookup core piece
   let SourceView{stateRef} = sview
-  SourceViewState{dbgMap,tags} <- readIORef stateRef
-  let dbg = case ltags of
-        []  -> Nothing
-        t:_ -> tagDebug t
-      parentSub = fmap getSubsumationEntry dbg
+  SourceViewState{dbgMap,tags,openEntries} <- readIORef stateRef
   case lookupCore dbgMap unit bind cons of
     Nothing
       -> writeSource sview iter tags $ "#ref " ++ unit ++ "/" ++ bind ++ "/" ++ cons ++ "!#"
@@ -1480,8 +1475,7 @@ corePrinter sview iter unit ltags (Right (bind, cons)) cont = do
     -- Subsumed core piece? Generate open fold
     Just cdbg | Just core <- dbgDCore cdbg,
                 sub <- getSubsumationEntry cdbg,
-                Just sub == parentSub ||
-                  parentSub == fmap getSubsumationEntry (dbgParent sub) && parentSub /= Nothing
+                sub `elem` openEntries
       -> do let ltags' = tagByCore tags cdbg : ltags
             writeOpenMarkStart sview iter unit (bind, cons)
             printCore sview iter unit ltags' (dbgCoreCode core)
@@ -1557,6 +1551,10 @@ activateMark sview@SourceView{stateRef} coreBuffer pos = do
               printCore sview iter unit ltags core
               writeOpenMarkEnd sview iter unit (cname, cons)
               updateStructPixbufMap sview
+              -- Update state
+              modifyIORef stateRef $ \s -> s {
+                openEntries = entry : openEntries s
+                }
               return ()
       _ -> return ()
 
@@ -1567,8 +1565,8 @@ activateMark sview@SourceView{stateRef} coreBuffer pos = do
 
     -- Find end mark
     case name >>= decomposeName of
-      Nothing -> return ()
-      Just (unit, cname, cons) -> do
+      Just (unit, cname, cons) | Just entry <- lookupCore dbgMap unit cname cons
+                                 -> do
         m_markEnd <- textBufferGetMark coreBuffer (markNameEnd unit (cname, cons))
         case m_markEnd of
           Nothing -> return ()
@@ -1593,7 +1591,9 @@ activateMark sview@SourceView{stateRef} coreBuffer pos = do
             modifyIORef stateRef $ \s ->
               s { lineTags = let (pr, re) = splitAt line (lineTags s)
                              in pr ++ drop (lineEnd - line) re
+                , openEntries = filter (/=entry) $ openEntries s
                 }
+      _ -> return ()
 
   -- Same again, this time for up marks
   forM_ upMarks $ \mark -> do

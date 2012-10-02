@@ -331,10 +331,11 @@ sourceViewNew builder opts SourceViewActions{..} = do
       , cellBackgroundSet := hint ]
   cellLayoutSetAttributeFunc srcTagNameCol srcTagNameRender srcTagsStore $ \iter -> do
     tag <- treeModelGetRow srcTagsStore iter
+    hint <- checkHint tag
     set srcTagNameRender
       [ cellText := stagName tag
       , cellBackgroundColor := bgColor
-      , cellBackgroundSet := active ]
+      , cellBackgroundSet := hint ]
     return ()
 
   -- Set up search column
@@ -353,6 +354,17 @@ sourceViewNew builder opts SourceViewActions{..} = do
     updateFileView srcView
   after coreView sourceViewLineMarkActivated $ \pos ->
     liftIO $ activateMark srcView coreBuffer pos
+  on coreBuffer markSet $ \iter mark -> do
+    markName <- textMarkGetName mark
+    when (markName == Just "insert") $ do
+      state@SourceViewState{lineTags} <- readIORef stateRef
+      -- Get top-level tag at given line
+      line <- textIterGetLine iter
+      case drop line lineTags of
+        ((tag:_):_) -> do
+          writeIORef stateRef state{hintSel=[tag]}
+          widgetQueueDraw srcTagsTreeView
+        _other -> return ()
 
   -- Set up tooltip. queryTooltip doesn't seem to work, so
   -- we use some lame hack using selection.
@@ -659,7 +671,7 @@ sourceViewSetSelection view@SourceView{..} timeSel = do
   tags' `deepseq`
     writeIORef stateRef state{
       tags=tags', sourceTags=sourceTags', fileTags=fileTags',
-      selection=selection', srcSel=srcSel', hintSel=stagTags srcSel'
+      selection=selection', srcSel=srcSel', hintSel=maybe [] stagTags srcSel'
       }
 
   -- Update views
@@ -787,7 +799,8 @@ updateSrcTagSelection view@SourceView{..} = do
                     return (Just tag)
     Nothing   -> return Nothing
   writeIORef stateRef state {
-    srcSel = select'
+    srcSel = select',
+    hintSel = maybe [] stagTags select',
     }
 
   case select' of

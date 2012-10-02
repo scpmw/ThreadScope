@@ -1,4 +1,4 @@
-Name:                threadscope
+Name:                threadscope-pmw
 Version:             0.2.1
 Category:            Development, Profiling, Trace
 Synopsis:            A graphical tool for profiling parallel Haskell programs.
@@ -38,10 +38,11 @@ source-repository head
   type:     darcs
   location: http://code.haskell.org/ThreadScope/
 
-Executable threadscope
+Executable threadscope-pmw
   Main-is:           Main.hs
   Build-Depends:     base >= 4.0,
-                     gtk >= 0.12, cairo, glib, pango, gtksourceview2, transformers,
+                     gtk >= 0.12, cairo, glib, pango,
+                     gtksourceview2, transformers,
                      binary, array, mtl, filepath,
                      ghc-events-pmw == 0.4.*,
                      containers >= 0.2, pretty,

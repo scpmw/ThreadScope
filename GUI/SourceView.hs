@@ -80,6 +80,8 @@ data SourceView = SourceView {
   tagsStore    :: ListStore Tag,
   srcTagsTreeView :: TreeView,
   srcTagsStore    :: TreeStore SourceTag,
+  sampleChooser   :: ComboBox,
+  sampleChoiceStore :: ListStore SampleType,
   structRenderer  :: CellRendererPixbuf,
   globalSearchDirs:: [FilePath],
 
@@ -92,6 +94,9 @@ data SourceViewState
   = SourceViewState {
     eventsArr  :: EventsArray,
     dbgMap     :: DebugMaps,
+    selStart   :: Timestamp,
+    selEnd     :: Timestamp,
+    sampleType :: SampleType,
     tags       :: [Tag],
     sourceTags :: [SourceTag],
     fileTags   :: [SourceTag],
@@ -148,6 +153,9 @@ initViewState :: SourceViewState
 initViewState = SourceViewState {
   eventsArr = listArray (0,0) [],
   dbgMap = emptyDebugMaps,
+  selStart = 0,
+  selEnd = 0,
+  sampleType = SampleByCycle,
   tags = [],
   sourceTags = [],
   fileTags = [],
@@ -343,6 +351,24 @@ sourceViewNew builder opts SourceViewActions{..} = do
   treeViewSetSearchColumn srcTagsTreeView (makeColumnIdString 1)
   treeViewSetEnableSearch srcTagsTreeView True
 
+  -- Get sample type chooser
+  sampleChooser <- getWidget castToComboBox "sample_type_chooser"
+  sampleChoiceStore <- listStoreNew [SampleByCycle, SampleByHeap]
+
+  sampleChoiceRender <- cellRendererTextNew
+  cellLayoutPackStart sampleChooser sampleChoiceRender True
+  cellLayoutSetAttributeFunc sampleChooser sampleChoiceRender sampleChoiceStore $ \iter -> do
+    choice <- treeModelGetRow sampleChoiceStore iter
+    set sampleChoiceRender
+      [ cellText := case choice of
+           SampleByCycle -> "By CPU Cycles"
+           SampleByHeap  -> "By Allocation" ]
+    return ()
+
+  comboBoxSetModel sampleChooser (Just sampleChoiceStore)
+  Just firstEntry <- treeModelGetIterFirst sampleChoiceStore
+  comboBoxSetActiveIter sampleChooser firstEntry
+
   let globalSearchDirs = optSearchPaths opts
       srcView    = SourceView {..}
 
@@ -366,6 +392,14 @@ sourceViewNew builder opts SourceViewActions{..} = do
           writeIORef stateRef state{hintSel=[tag]}
           widgetQueueDraw srcTagsTreeView
         _other -> return ()
+  on sampleChooser changed $ do
+    miter <- comboBoxGetActiveIter sampleChooser
+    case miter of
+      Just iter -> do
+        sampleType <- treeModelGetRow sampleChoiceStore iter
+        modifyIORef stateRef $ \state -> state { sampleType = sampleType }
+        loadTags srcView
+      Nothing -> return ()
 
   -- Set up tooltip. queryTooltip doesn't seem to work, so
   -- we use some lame hack using selection.
@@ -621,14 +655,25 @@ sourceViewAdjustSelection SourceView{..} (PointSelection sel) = do
   return $ Just $ RangeSelection sel $! endTime
 
 sourceViewSetSelection :: SourceView -> TimeSelection -> IO ()
-sourceViewSetSelection view@SourceView{..} timeSel = do
-  state@SourceViewState{..} <- readIORef stateRef
-  let interval = case timeSel of
+sourceViewSetSelection view@SourceView{stateRef} timeSel = do
+
+  let (start, end) = case timeSel of
         PointSelection start -> (start, start)
         RangeSelection start end -> (start, end)
 
+  modifyIORef stateRef $ \state -> state {
+    selStart = start,
+    selEnd = end }
+
+  loadTags view
+
+loadTags :: SourceView -> IO ()
+loadTags view@SourceView{..} = do
+
+  state@SourceViewState{..} <- readIORef stateRef
+
   -- Load tags for new position
-  let tags' = tagsByInterval eventsArr dbgMap interval
+  let tags' = tagsByInterval sampleType eventsArr dbgMap (selStart, selEnd)
 
   -- Update selection, if possible
   let selection' = selection >>= (\t -> find (== t) tags')
@@ -1172,8 +1217,8 @@ weightedMixedSamplesByInterval eventsArr rangeMap interval =
         muFract = fromIntegral (totTime - gcTime) / fromIntegral totTime
  --}
 
-tagsByInterval :: EventsArray -> DebugMaps -> (Timestamp, Timestamp) -> [Tag]
-tagsByInterval eventsArr rangeMap interval =
+tagsByInterval :: SampleType -> EventsArray -> DebugMaps -> (Timestamp, Timestamp) -> [Tag]
+tagsByInterval sampleType eventsArr rangeMap interval =
   let toTag freq (Just dbg)
         = tagFromDebug freq dbg
       toTag freq Nothing
@@ -1186,7 +1231,7 @@ tagsByInterval eventsArr rangeMap interval =
                         }
           in tag
 
-      weighted = weightedSamplesByInterval SampleByHeap eventsArr rangeMap interval
+      weighted = weightedSamplesByInterval sampleType eventsArr rangeMap interval
       grandSum = sum $ map fst weighted
       tags = map (uncurry toTag . first (/grandSum)) weighted
 

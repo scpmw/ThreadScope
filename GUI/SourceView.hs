@@ -476,7 +476,7 @@ sourceViewSetEvents SourceView{..} m_file m_data = do
       return initViewState {
         eventsArr = eventsArr,
         dbgMap = dbgMap,
-        tags = tagsFromLocalIPs2 0 eventsArr dbgMap,
+        tags = [],
         searchDirs = searchDirs
         }
 
@@ -914,187 +914,12 @@ sourceTagEquiv :: SourceTag -> SourceTag -> Bool
 sourceTagEquiv st1 st2
   = stagFile st1 == stagFile st2 && stagName st1 == stagName st2
 
-
-------------------------------------------------------------------------------
-
-{--
-findLocalEvents :: Int -> Timestamp -> EventsArray -> (CapEvent -> Maybe a) -> [a]
-findLocalEvents n winSize eventsArr filter_f =
-  let winMid        = time $ ce_event $ eventsArr ! n
-      eventsWhile f = takeWhile (f.time.ce_event) . map (eventsArr !)
-      (low, high)   = bounds eventsArr
-      eventsBefore  = eventsWhile (>winMid-winSize) [n-1,n-2..low]
-      eventsAfter   = eventsWhile (<winMid+winSize) [n,n+1..high]
-  in mapMaybe filter_f eventsBefore ++ mapMaybe filter_f eventsAfter
---}
-
-findLocalEventsCount :: Int -> Int -> EventsArray -> (CapEvent -> Maybe a) -> (a -> Int) -> [a]
-findLocalEventsCount n maxCount eventsArr filter_f count_f =
-  let winMid        = time $ ce_event $ eventsArr ! n
-      midDist e     = absDiff (time (ce_event e)) winMid
-      absDiff x y  = if x > y then x - y else y - x
-
-      -- Get events before and after point of interest
-      (low, high)   = bounds eventsArr
-      eventsBefore  = map (eventsArr !) [n-1,n-2..low]
-      eventsAfter   = map (eventsArr !) [n,n+1..high]
-
-      -- Combine events into a common list, sorted by distance to mid point
-      zippity [] as = as
-      zippity bs [] = bs
-      zippity (a:as) (b:bs)
-        | midDist a < midDist b
-                    = a:zippity as (b:bs)
-        | otherwise = b:zippity (a:as) bs
-      zippedEvents  = zippity eventsBefore eventsAfter
-
-      -- Filter the events
-      filteredEvents= mapMaybe filter_f zippedEvents
-
-      -- Accumulate using count_f how many samples each event
-      -- has. Stop once we have enough. Note that scanl adds the
-      -- initial accumulator to the list, so we actually get the index
-      -- of the first element where we go over the count.
-      returnCount   = findIndex (>maxCount) $
-                      scanl (\c x -> c + count_f x) 0 filteredEvents
-
-  in case returnCount of
-    Just ix   -> take ix filteredEvents
-    Nothing   -> filteredEvents
-
--- | Weight to give to a sample. Simply the normal distribution.
-sampleWeight :: Timestamp -> Timestamp -> Timestamp -> Double
-sampleWeight mid dev val =
-  exp (fromIntegral ((val - mid) ^ 2) / fromIntegral (dev * dev))
-
-{--
-
--- Dumps are normally generated for every RTS timer event, which fires
--- 50 times per second (= 20 ms).
-tickSampleWinSize, tickSampleStdDev :: Timestamp
-tickSampleWinSize = 50 * 1000 * 1000
-tickSampleStdDev  = 20 * 1000 * 1000
-
-
-findLocalTickSamples :: Int -> EventsArray -> [(Timestamp, [(Word32, Word32)])]
-findLocalTickSamples startIx eventsArr =
-  let getTick CapEvent { ce_event = Event { time, spec = TickDump{..} } }
-        = Just ({-cap, -}time, dump)
-      getTick _other
-        = Nothing
-  in findLocalEvents startIx tickSampleWinSize eventsArr getTick
-
-weightTicks :: Timestamp -> Timestamp -> [(Word32, Word32)] -> [(Word32, Double)]
-weightTicks mid time = map (second f)
-  where f hitCount = fromIntegral hitCount * weight
-        weight     = sampleWeight mid tickSampleStdDev time
-
-findLocalTicks :: Int -> EventsArray -> [(Word32, Double)]
-findLocalTicks startIx eventsArr =
-
-  -- Find ticks around start point
-  let winMid        = time $ ce_event $ eventsArr ! startIx
-      samples       = findLocalTickSamples startIx eventsArr
-
-      -- Weight them by distance to start point
-      weighted      = map (uncurry $ weightTicks winMid) samples
-
-      -- Sum up weighted frequencies by tick IDs
-      summed        = nubSumBy (compare `F.on` fst) (\(t,w1) (_,w2)->(t,w1+w2)) $ concat weighted
-      grandSum      = sum $ map snd summed
-      normalized    = map (second (/ grandSum)) summed
-
-  in normalized
-
-tagsFromLocalTicks :: Int -> EventsArray -> DbgMap -> [Tag]
-tagsFromLocalTicks startIx eventsArr dbgMap = map toTag $ findLocalTicks startIx eventsArr
-  where toTag (tick, freq) =
-          let dbg = lookupDbgInstr (fromIntegral tick) dbgMap
-              tag = Tag { tagUnit   = dbgUnit <$> dbg
-                        , tagName   = Nothing
-                        , tagTick   = Just (fromIntegral tick)
-                        , tagDebug  = dbg
-                        , tagFreq   = freq
-                        , tagEntry  = tag
-                        }
-          in tag
---}
-
 -------------------------------------------------------------------------------
-
--------------------------------------------------------------------------------
-
--- Instruction pointer samples are a bit more tricky than tick
--- samples. Let's assume one sample every 10,000 cycles (current
--- default) and one event per 1,024 samples (ditto), this makes about
--- 10,000,000 cycles per event. As modern computers run at clock speed
--- of at least 1,000,000,000 Hz, this means events should be about
--- 10ms apart, at maximum.
---
--- Obviously this argument isn't really water-proof, as our profiling
--- eats away at this as well. Sooner or later we might want something
--- adaptive...
-_ipSampleWinSize, ipSampleStdDev :: Timestamp
-_ipSampleWinSize = 50 * 1000 * 1000
-ipSampleStdDev  = 20 * 1000 * 1000
-ipSampleMaxCount :: Int
-ipSampleMaxCount = 1000
-
-findLocalIPsamples :: Int -> EventsArray -> [(Timestamp, [Word64])]
-findLocalIPsamples startIx eventsArr =
-  let getIPs CapEvent{{-ce_cap,-}ce_event=Event{time,spec=InstrPtrSample{..}}}
-        = Just ({- ce_cap, -}time, UA.elems ips)
---      getIPs CapEvent{{-ce_cap,-}ce_event=Event{time,spec=Blackhole{..}}}
---        = Just (time, [ip])
-      getIPs _other
-        = Nothing
-      count_f (_, ips) = length ips
-      samples = findLocalEventsCount startIx ipSampleMaxCount eventsArr getIPs count_f
-  in samples
 
 -- | Removes duplicates and allows for custom combination function
 nubSumBy :: (a -> a -> Ordering) -> (a -> a -> a) -> [a] -> [a]
 nubSumBy ord plus = map (foldr1 plus) . groupBy eq . sortBy ord
   where x `eq` y = ord x y == EQ
-
--- | Finds local IP samples, return weighted
-findLocalIPsWeighted :: Int -> EventsArray -> DebugMaps -> [(Double, Maybe DebugEntry)]
-findLocalIPsWeighted startIx eventsArr rangeMap =
-  let -- Find samples
-      ipss = findLocalIPsamples startIx eventsArr
-
-      -- Give each range a weight
-      winMid = time $ ce_event $ eventsArr ! startIx
-      weight = sampleWeight winMid ipSampleStdDev
-      toWeighted t = first ((* weight t) . fromIntegral)
-      worker (t, ips) = map (toWeighted t) $ lookupRanges rangeMap ips
-      wips = concatMap worker ipss
-
-      -- Combine duplicated ranges
-      ord = compare `F.on` (fmap dbgId . snd)
-      (w1, _) `plus` (w2, r) = (w1+w2, r)
-  in nubSumBy ord plus wips
-
-tagsFromLocalIPs2 :: Int -> EventsArray -> DebugMaps -> [Tag]
-tagsFromLocalIPs2 startIx eventsArr rangeMap =
-  let toTag freq (Just dbg)        = tagFromDebug freq dbg
-      toTag freq Nothing
-        = let tag = Tag { tagUnit = Nothing
-                        , tagName = Just "-unrecognized-"
-                        , tagTick = Nothing
-                        , tagDebug = Nothing
-                        , tagFreq = freq
-                        , tagEntry = tag
-                        }
-          in tag
-
-      weighted = findLocalIPsWeighted startIx eventsArr rangeMap
-      grandSum = sum $ map fst weighted
-      tags = map (uncurry toTag . first (/grandSum)) weighted
-
-      ord = compare `F.on` (fmap dbgId . tagDebug)
-      t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }
-  in nubSumBy ord plus tags
 
 -------------------------------------------------------------------------------
 
@@ -1316,7 +1141,8 @@ getFileSourceSpans sourceFile tags =
    in nubSumBy (compare `F.on` snd) (\(f1, _) (f2, t) -> (f1+f2,t)) spans
 --}
 
-  -- "Safe" version of textBufferGetIterAtLineOffset
+-- "Safe" version of textBufferGetIterAtLineOffset that doesn't crash
+-- when the offset happens to be invalid.
 textBufferGetIterAtLineOffsetSafe :: TextBufferClass self => self -> Int -> Int -> IO TextIter
 textBufferGetIterAtLineOffsetSafe buf l c = do
   lineCount <- textBufferGetLineCount buf

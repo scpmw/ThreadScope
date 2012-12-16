@@ -229,12 +229,12 @@ buildRangeMap dbgs =
       -- Scans range list and inserts all ranges into a map.
       down :: [(Int, Int, DebugEntry)] -> [(Int, Int, DebugEntry)]
               -> RangeMap -> RangeMap
-      down []     []              !rm = rm
-      down (s:ss) []              !rm = up ss []     (high s) rm
-      down []     (r:rs)          !rm = down [r] rs           (IM.insert (low r) (dbg r) rm)
-      down (s:ss) (r:rs)          !rm
-        | high s <= low r             = up ss (r:rs) (high s) rm
-        | otherwise                   = down (r:s:ss) rs      (IM.insert (low r) (dbg r) rm)
+      down []     []      !rm = rm
+      down (s:ss) []      !rm = up ss []     (high s) rm
+      down []     (r:rs)  !rm = down [r] rs           (IM.insert (low r) (dbg r) rm)
+      down (s:ss) (r:rs)  !rm
+        | high s <= low r     = up ss (r:rs) (high s) rm
+        | otherwise           = down (r:s:ss) rs      (IM.insert (low r) (dbg r) rm)
 
       -- Called to remove items from the stack, maybe re-inserting
       -- some ranges that were overriden but still apply. Will revert

@@ -35,7 +35,7 @@ import Data.Char (chr, ord, isSpace, isAlphaNum, digitToInt)
 import qualified Data.Function as F
 import Data.IORef
 import qualified Data.Map as Map
-import Data.Maybe (mapMaybe, fromMaybe)
+import Data.Maybe (mapMaybe, fromMaybe, fromJust)
 import Data.Monoid (mappend)
 import Data.List
 import qualified Data.Set as Set
@@ -1283,7 +1283,7 @@ showCore sview@SourceView{coreBuffer,stateRef} tag = do
 -- | Writes top-level core, including an "up" link if appropriate
 printTopLevel :: SourceView -> TextIter -> String -> Maybe DebugEntry -> [Tag] -> CoreExpr -> IO ()
 printTopLevel sview iter unit dbg ltags core
-  = case findDbgElem dbgDCore (dbgParent =<< dbg) of
+  = case findDbgElem dbgDCore (fmap getSubsumationEntry . dbgParent =<< dbg) of
       Just parent -> do
         let parent_bind = (bsToStr $ dbgCoreBind parent,
                            bsToStr $ dbgCoreCons parent)
@@ -1570,25 +1570,66 @@ subsumeTags = nubSumBy cmp plus . map subsume
            }
          subsume t = t { tagDebug = fmap getSubsumationEntry $ tagDebug t }
 
--- | Finds debug entry
+-- | Should the entry subsume cost up the tree, where possible?
+shouldSubsume :: DebugEntry -> Bool
+shouldSubsume DebugEntry { dbgDCore = Just (DebugEntryCore _ _ Lam{}) }
+                      = False
+shouldSubsume _other  = True
+
+-- | Finds debug entry that the cost should be subsumed to
 getSubsumationEntry :: DebugEntry -> DebugEntry
 getSubsumationEntry entry = case dbgParent entry of
-  Nothing -> entry
-  Just parent -> case dbgDCore entry of
-    Just (DebugEntryCore _ _ Lam{}) -> entry
-    _                               -> getSubsumationEntry parent
+  Just parent | shouldSubsume entry
+              -> parent
+  _other      -> entry
 
--- | For the lack of a better name - find direct parent/child pairs
--- and merge them
-subsumeTagFamilies :: [Tag] -> [Tag]
+-- | Find all entries that get subsumed together with the given debug
+-- entry
+findSubsumedEntries :: DebugEntry -> [DebugEntry]
+findSubsumedEntries = go . getSubsumationEntry
+  where go entry = trace ("blubber id="++show(dbgId entry) ++" cids="++show(map(dbgLabel) (filter shouldSubsume $ dbgChilds entry))) $
+                   entry : concatMap go (filter shouldSubsume $ dbgChilds entry)
+
+-- | From a number of selected entries, generate roots of covering
+-- sub-trees and a list of all "open" entries
+subsumeTagFamilies :: [Tag] -> ([Tag], [DebugEntry])
+{-
 subsumeTagFamilies tags = subsumeTags $ map moveToParent tags
  where
   dbgs = mapMaybe tagDebug tags
   moveToParent t
     | Just p <- fmap getSubsumationEntry $ (>>= dbgParent) $ tagDebug t, p `elem` dbgs
-      = t { tagDebug = Just p }
+      = moveToParent t { tagDebug = Just p }
     | otherwise
       = t
+-}
+subsumeTagFamilies tags = (roots, nub $ concat nodes)
+ where -- For every tag, construct the list of all their parents, with
+       -- themselves as the last entry
+       ancestry = reverse . map fromJust . takeWhile (/= Nothing) . iterate (>>= dbgParent)
+       -- Group all ancentries by common eldest node
+       groups = groupBy ((==) `F.on` head) $ filter (not . null) $ map (ancestry . tagDebug) tags
+       -- Remove oldest node until we diverge
+       findRoot group
+         | any ((<= 1) . length) group
+         = (root, children ++ subsumed)
+         | same (map head group)
+         = findRoot (map tail group)
+         | otherwise
+         = (root, children ++ subsumed)
+         where -- The root's weight is the sum of all subsumed tags -
+               -- have to search them again from the original list
+               findTag dbg = fromJust $ find ((== Just dbg) . tagDebug) tags
+               weight = sum $ map (tagWeight . findTag . last) group
+               -- Construct a new tag for the root node
+               root   = tagFromDebug weight (head (head group))
+               -- Open entries shall be all ancestry up to the root
+               -- node as well as all children that should be subsumed.
+               children = concatMap tail group
+               subsumed = concatMap (findSubsumedEntries . last) group
+               same (x:xs) = all (==x) xs
+               same []     = error "same"
+       (roots, nodes) = unzip $ map findRoot groups
 
 ------------------------------------------------------------------------------
 

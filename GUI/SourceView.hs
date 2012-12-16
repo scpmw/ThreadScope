@@ -81,7 +81,7 @@ data SourceView = SourceView {
   srcTagsTreeView :: TreeView,
   srcTagsStore    :: TreeStore SourceTag,
   sampleChooser   :: ComboBox,
-  sampleChoiceStore :: ListStore SampleType,
+  sampleChoiceStore :: ListStore SampleVerb,
   structRenderer  :: CellRendererPixbuf,
   globalSearchDirs:: [FilePath],
 
@@ -96,7 +96,7 @@ data SourceViewState
     dbgMap     :: DebugMaps,
     selStart   :: Timestamp,
     selEnd     :: Timestamp,
-    sampleType :: SampleType,
+    sampleType :: SampleVerb,
     tags       :: [Tag],
     sourceTags :: [SourceTag],
     fileTags   :: [SourceTag],
@@ -353,7 +353,7 @@ sourceViewNew builder opts SourceViewActions{..} = do
 
   -- Get sample type chooser
   sampleChooser <- getWidget castToComboBox "sample_type_chooser"
-  sampleChoiceStore <- listStoreNew [SampleByCycle, SampleByHeap]
+  sampleChoiceStore <- listStoreNew [SampleByCycle, SampleByHeap, SampleByLifeHeap]
 
   sampleChoiceRender <- cellRendererTextNew
   cellLayoutPackStart sampleChooser sampleChoiceRender True
@@ -362,7 +362,8 @@ sourceViewNew builder opts SourceViewActions{..} = do
     set sampleChoiceRender
       [ cellText := case choice of
            SampleByCycle -> "By CPU Cycles"
-           SampleByHeap  -> "By Allocation" ]
+           SampleByHeap  -> "By Allocation"
+           SampleByLifeHeap -> "By Heap Data" ]
     return ()
 
   comboBoxSetModel sampleChooser (Just sampleChoiceStore)
@@ -1107,11 +1108,11 @@ eventsByInterval eventsArr (start, end) filter_f = go startIx
                           = x : go (i+1)
              | otherwise  = go (i+1)
 
-samplesByInterval :: SampleType -> EventsArray -> (Timestamp, Timestamp) -> [(Timestamp, [Word64])]
+samplesByInterval :: SampleVerb -> EventsArray -> (Timestamp, Timestamp) -> [(Timestamp, [(Int, Word64)])]
 samplesByInterval stype eventsArr range =
-  let getSamples CapEvent{{-ce_cap,-}ce_event=Event{time,spec=InstrPtrSample{..}}}
-        | sample_type == stype
-        = Just ({- ce_cap, -}time, UA.elems ips)
+  let getSamples CapEvent{{-ce_cap,-}ce_event=Event{time,spec=Samples{..}}}
+        | sample_type == SampleInstrPtr && sample_by == stype
+        = Just ({- ce_cap, -}time, zip (map fromIntegral $ UA.elems weights) (UA.elems samples))
       getSamples _other
         = Nothing
       samples = eventsByInterval eventsArr range getSamples
@@ -1155,7 +1156,7 @@ findGCs eventsArr (start, end) = go_start startIx
              -> True
           _  -> False
 --}
-weightedSamplesByInterval :: SampleType -> EventsArray -> DebugMaps -> (Timestamp, Timestamp)
+weightedSamplesByInterval :: SampleVerb -> EventsArray -> DebugMaps -> (Timestamp, Timestamp)
                              -> [(Double, Maybe DebugEntry)]
 weightedSamplesByInterval sampleType eventsArr rangeMap interval = weighted
   where samples    = samplesByInterval sampleType eventsArr interval
@@ -1220,7 +1221,7 @@ weightedMixedSamplesByInterval eventsArr rangeMap interval =
         muFract = fromIntegral (totTime - gcTime) / fromIntegral totTime
  --}
 
-tagsByInterval :: SampleType -> EventsArray -> DebugMaps -> (Timestamp, Timestamp) -> [Tag]
+tagsByInterval :: SampleVerb -> EventsArray -> DebugMaps -> (Timestamp, Timestamp) -> [Tag]
 tagsByInterval sampleType eventsArr rangeMap interval =
   let toTag freq (Just dbg)
         = tagFromDebug freq dbg

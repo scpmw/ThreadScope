@@ -252,44 +252,50 @@ buildRangeMap dbgs =
 -- | Lookup an instruction pointer in the range map.
 lookupRange :: DebugMaps -> Int -> Maybe DebugEntry
 lookupRange maps ip
-  = case IM.splitLookup ip $ rangeMap maps of
+  = -- use lookupLE here once container-0.5 is common enough...
+    case IM.splitLookup ip $ rangeMap maps of
     (_, Just r, _)           -> Just r
     (lowerRanges, _, _)
       | IM.null lowerRanges  -> trace msg $ Nothing
       | (_, r) <- IM.findMax lowerRanges
-        , any (\(IPRange l h) -> l <= ip && ip < h) (dbgRanges r)
+        , any (ip `inIPRange`) (dbgRanges r)
                              -> Just r
       | otherwise            -> trace msg $ Nothing
 
   where msg = printf "Could not place IP %08x" ip
 
 -- | Looks up a number of ranges, groups together same ranges
-lookupRanges :: DebugMaps -> [Word64] -> [(Int, Maybe DebugEntry)]
+lookupRanges :: DebugMaps -> [(Int, Word64)] -> [(Int, Maybe DebugEntry)]
 lookupRanges maps ips =
   let -- Check whether the first IP has a match in the range map
       go []      _  res = res
-      go (ip:is) rm res = case IM.splitLookup ip rm of
-        (_,     Just d,  rm')         -> found 0 (ip:is) d rm' res
+      go is0@((_,ip):is) rm res = case IM.splitLookup ip rm of
+        (_,     Just d,  rm')         -> found 0 is0 d rm' res
         (lower, Nothing, rm')
           | IM.null lower             -> not_found ip is rm' res
-          | (_,d) <- IM.findMax lower -> found 0 (ip:is) d rm' res
+          | (_,d) <- IM.findMax lower -> found 0 is0 d rm' res
           | otherwise                 -> not_found ip is rm' res
       -- Found a (possibly) matching debug entry, count number of IPs
       -- that actually match, then continue with reduced IPs and range
       -- map as well as another entry in the hits list..
-      found n (ip:is) d rm res
-        | any (\(IPRange l h) -> l <= ip && ip < h) (dbgRanges d)
-          = found (n+1) is d rm res
+      found n ((w,ip):is) d rm res
+        | any (ip `inIPRange`) (dbgRanges d)
+          = found (n+w) is d rm res
       found n ips d rm (hs,ms)
           = go ips rm (if n > 0 then (n,Just d):hs else hs, ms)
       not_found ip is rm (hs, ms)
         = trace (printf "Could not place IP %08x" ip) $
           go is rm (hs, ms+1)
 
-      (hits, misses) = go (sort $ map fromIntegral ips) (rangeMap maps) ([], 0)
+      process (w, p) = (w, fromIntegral p)
+      preprocessed   = sortBy (comparing snd) $ map process ips
+      (hits, misses) = go preprocessed (rangeMap maps) ([], 0)
    in if misses > 0
       then (misses, Nothing):hits
       else hits
+
+inIPRange :: Int -> IPRange -> Bool
+inIPRange ip (IPRange l h) = l <= ip && ip < h
 
 -------------------------------------------------------------------------------
 

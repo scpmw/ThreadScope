@@ -31,7 +31,7 @@ import Graphics.Rendering.Cairo
 import Data.Array
 import qualified Data.Array.Unboxed as UA
 import qualified Data.ByteString as BS
-import Data.Char (chr, ord, isSpace, isAlphaNum)
+import Data.Char (chr, ord, isSpace, isAlphaNum, digitToInt)
 import qualified Data.Function as F
 import Data.IORef
 import qualified Data.Map as Map
@@ -689,10 +689,14 @@ loadTags view@SourceView{..} = do
                                       , stagName = bsToStr $ spanName src
                                       , stagSources = [src]
                                       , stagTags = [tag]
-                                      , stagFreq = tagFreq tag }
-      mkNoSourceTag tag = SourceTag { stagFile = if "stg_" `isPrefixOf` fromMaybe "" (tagName tag) 
-                                                 then "(STG)"
-                                                 else "(no haskell)"
+                                      , stagWeight = tagWeight tag }
+      mkNoSourceTag tag = SourceTag { stagFile = case () of
+                                         _ | "stg_" `isPrefixOf` fromMaybe "" (tagName tag)
+                                           -> "(STG)"
+                                           | "_con_info" `isSuffixOf` fromMaybe "" (tagName tag)
+                                           -> "(primitive)"
+                                           | otherwise
+                                           -> "(no haskell)"
                                     , stagName = maybe "?" (\x -> "("++x++")") $ tagName tag
                                     , stagSources = []
                                     , stagTags = [tag]
@@ -1103,6 +1107,14 @@ zdecode ('z':'t':cs) = '*':zdecode cs
 zdecode ('z':'u':cs) = '_':zdecode cs
 zdecode ('z':'v':cs) = '%':zdecode cs
 zdecode ('z':'z':cs) = 'z':zdecode cs
+zdecode ('Z':'L':cs) = '(':zdecode cs
+zdecode ('Z':'R':cs) = ')':zdecode cs
+zdecode ('Z':'M':cs) = '[':zdecode cs
+zdecode ('Z':'N':cs) = ']':zdecode cs
+zdecode ('Z':'C':cs) = ':':zdecode cs
+zdecode ('Z':n:'T':cs) = '(':(replicate (digitToInt n) ',' ++ ')':zdecode cs)
+zdecode ('Z':n:'H':cs) = '(':'#':(replicate (digitToInt n) ',' ++ '#':')':zdecode cs)
+zdecode ('Z':'Z':cs) = 'Z':zdecode cs
 zdecode (c:cs)       = c:zdecode cs
 zdecode []           = []
 

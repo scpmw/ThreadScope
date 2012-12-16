@@ -122,7 +122,7 @@ data Tag = Tag {
   -- | Debug data available for the tag
   tagDebug :: Maybe DebugEntry,
   -- | Approximate frequency of the tag getting hit
-  tagFreq :: !Double,
+  tagWeight :: !Double,
   -- | Tag for the (top-level) entry node of subsumed tags
   tagEntry :: Tag
   }
@@ -133,7 +133,7 @@ data SourceTag = SourceTag {
   stagName :: String,
   stagSources :: [Span],
   stagTags :: [Tag],
-  stagFreq :: !Double
+  stagWeight :: !Double
   }
 
 instance Eq Tag where
@@ -186,7 +186,7 @@ bsToStr = map (chr.fromIntegral) . BS.unpack
 
 dumpTag :: Tag -> IO ()
 dumpTag tag = do
-  putStr $ printf "%02.2f" (100 * tagFreq tag) ++ "% "
+  putStr $ printf "%02.2f" (100 * tagWeight tag) ++ "% "
   case tagDebug tag of
     Just dbg -> do
       let subs = getSubsumationEntry dbg
@@ -269,8 +269,8 @@ sourceViewNew builder opts SourceViewActions{..} = do
         treeViewAppendColumn treeView col
         return col
 
-  tagFreqRender <- cellRendererTextNew
-  tagFreqCol    <- mkColumn tagsTreeView tagFreqRender "%"
+  tagWeightRender <- cellRendererTextNew
+  tagWeightCol    <- mkColumn tagsTreeView tagWeightRender "%"
   tagModRender  <- cellRendererTextNew
   tagModCol     <- mkColumn tagsTreeView tagModRender "Module"
   tagDescRender <- cellRendererTextNew
@@ -281,8 +281,8 @@ sourceViewNew builder opts SourceViewActions{..} = do
   -- Set column content
   treeViewSetModel tagsTreeView tagsStore
 
-  cellLayoutSetAttributes tagFreqCol tagFreqRender tagsStore $ \Tag{..} ->
-    [ cellText := printf "%02.1f" (tagFreq * 100) ]
+  cellLayoutSetAttributes tagWeightCol tagWeightRender tagsStore $ \Tag{..} ->
+    [ cellText := printf "%02.1f" (tagWeight * 100) ]
 
   cellLayoutSetAttributes tagCoreCol tagCoreRender tagsStore $ \Tag{..} ->
     [ cellText := fromMaybe "" (bsToStr . dbgCoreBind <$> findDbgElem dbgDCore tagDebug) ]
@@ -334,8 +334,8 @@ sourceViewNew builder opts SourceViewActions{..} = do
     tag <- treeModelGetRow srcTagsStore iter
     hint <- checkHint tag
     set srcTagFreqRender
-      [ cellProgressText := Just $ printf "%02.1f" (stagFreq tag * 100)
-      , cellProgressValue := round (stagFreq tag * 100)
+      [ cellProgressText := Just $ printf "%02.1f" (stagWeight tag * 100)
+      , cellProgressValue := round (stagWeight tag * 100)
       , cellBackgroundColor := bgColor
       , cellBackgroundSet := hint ]
   cellLayoutSetAttributeFunc srcTagNameCol srcTagNameRender srcTagsStore $ \iter -> do
@@ -431,7 +431,7 @@ sourceViewNew builder opts SourceViewActions{..} = do
         clr <- lineTagClr srcView tag False
         -- only show text for first occurance
         let text | any (elem tag) pre = ""
-                 | otherwise          = printf "%02.1f%%" (tagFreq * 100)
+                 | otherwise          = printf "%02.1f%%" (tagWeight * 100)
         set costRenderer [ cellText := text
                          , cellTextBackgroundColor := clr
                          , cellTextBackgroundSet := True ]
@@ -695,10 +695,10 @@ loadTags view@SourceView{..} = do
                                     , stagName = maybe "?" (\x -> "("++x++")") $ tagName tag
                                     , stagSources = []
                                     , stagTags = [tag]
-                                    , stagFreq = tagFreq tag }
-      sourceTags' = sortBy (compare `F.on` stagFreq) $
+                                    , stagWeight = tagWeight tag }
+      sourceTags' = sortBy (compare `F.on` stagWeight) $
                     subsumeSrcTags False $ concatMap getSources tags'
-      fileTags' = sortBy (compare `F.on` stagFreq) $
+      fileTags' = sortBy (compare `F.on` stagWeight) $
                   map mkFileSrcTag $
                   subsumeSrcTags True $ concatMap getSources tags'
       mkFileSrcTag s
@@ -743,7 +743,7 @@ findDebugSources (Just DebugEntry{dbgSources, dbgParent})
 updateTagsView :: ListStore Tag -> [Tag] -> IO ()
 updateTagsView tagsStore tags = do
   let subsumed = subsumeTags tags
-      sorted = sortBy (flip (compare `F.on` tagFreq)) subsumed
+      sorted = sortBy (flip (compare `F.on` tagWeight)) subsumed
   listStoreClear tagsStore
   mapM_ (listStoreAppend tagsStore) sorted
 
@@ -881,7 +881,7 @@ updateSrcTagSelection view@SourceView{..} = do
 
       -- Show cores
       clearCore view
-      forM_ (reverse $ sortBy (compare `F.on` tagFreq) tags) $ \tag -> do
+      forM_ (reverse $ sortBy (compare `F.on` tagWeight) roots) $ \tag -> do
         iter <- textBufferGetEndIter coreBuffer
         writeSource view iter [] $ "---- " ++ fromMaybe "???" (tagName tag) ++ " ----\n"
         showCore view tag
@@ -1230,7 +1230,7 @@ tagsByInterval sampleType eventsArr rangeMap interval =
                         , tagName = Just "(unrecognized)"
                         , tagTick = Nothing
                         , tagDebug = Nothing
-                        , tagFreq = freq
+                        , tagWeight = freq
                         , tagEntry = tag
                         }
           in tag
@@ -1240,19 +1240,19 @@ tagsByInterval sampleType eventsArr rangeMap interval =
       tags = map (uncurry toTag . first (/grandSum)) weighted
 
       ord = compare `F.on` (fmap dbgId . tagDebug)
-      t1 `plus` t2 = t1 { tagFreq = tagFreq t1 + tagFreq t2 }
+      t1 `plus` t2 = t1 { tagWeight = tagWeight t1 + tagWeight t2 }
   in nubSumBy ord plus tags
 
 
 -------------------------------------------------------------------------------
 
 tagFromDebug :: Double -> DebugEntry -> Tag
-tagFromDebug freq dbg@DebugEntry {..}
+tagFromDebug weight dbg@DebugEntry {..}
   = let tag = Tag { tagUnit = Just $ bsToStr dbgUnit
                   , tagName = Just $ zdecode $ bsToStr dbgLabel
                   , tagTick = dbgInstr
                   , tagDebug = Just dbg
-                  , tagFreq = freq
+                  , tagWeight = weight
                   , tagEntry = tag
                   }
     in tag
@@ -1309,8 +1309,8 @@ updateTextTags SourceView{..} fw@FileView{..}= do
 -- the tags in the given file.
 getFileSourceSpans :: String -> [Tag] -> [(Double, Span)]
 getFileSourceSpans sourceFile tags =
-  let spans = [(tagFreq, src)
-              | Tag {tagFreq, tagDebug = Just dbg} <- tags
+  let spans = [(tagWeight, src)
+              | Tag {tagWeight, tagDebug = Just dbg} <- tags
               , src <- extSources dbg
               , fileName src == sourceFile ]
    in nubSumBy (compare `F.on` snd) (\(f1, _) (f2, t) -> (f1+f2,t)) spans
@@ -1494,7 +1494,7 @@ tagByCore tags core_dbg =
       let top_tag = case find ((== Just core_dbg) . tagDebug) tags of
             Just t  -> t
             Nothing -> head core_tags
-      in top_tag { tagFreq = sum (map tagFreq core_tags) }
+      in top_tag { tagWeight = sum (map tagWeight core_tags) }
 
 -- | Sets the tag for the given line
 writeLineTag :: SourceView -> TextIter -> [Tag] -> IO ()
@@ -1701,7 +1701,7 @@ subsumeTags = nubSumBy cmp plus . map subsume
                 _ | tagDebug t1 == tagDebug (tagEntry t1)  -> t1
                   | tagDebug t2 == tagDebug (tagEntry t2)  -> t2
                   | otherwise                              -> t2,
-             tagFreq = tagFreq t1 + tagFreq t2
+             tagWeight = tagWeight t1 + tagWeight t2
            }
          subsume t = t { tagDebug = fmap getSubsumationEntry $ tagDebug t }
 
@@ -1766,7 +1766,7 @@ subsumeSrcTags filesOnly = map mergeSources . nubSumBy cmpSpan plus
         plus st1 st2 = let tags' = nub (stagTags st1 ++ stagTags st2) in
           st1 { stagSources = stagSources st1 ++ stagSources st2
               , stagTags = tags'
-              , stagFreq = sum $ map tagFreq tags' }
+              , stagWeight = sum $ map tagWeight tags' }
         mergeSources st@SourceTag{stagSources}
           = st { stagSources = merge $ sortBy (comparing spanStart) stagSources }
         spanStart Span{..} = (startLine, startCol)
@@ -1869,7 +1869,7 @@ lineTagClr SourceView{stateRef,coreView} tag bg = do
   lColor <- styleGetDark style state
   bgColor <- styleGetBackground style state
   let m | bg        = 1.1 :: Double
-        | otherwise = max 0 (1 + log (tagFreq tag) / 7)
+        | otherwise = max 0 (1 + log (tagWeight tag) / 7)
       mix m (Color r1 g1 b1) (Color r2 g2 b2)
         = Color (round $ m * fromIntegral r1 + (1-m) * fromIntegral r2)
                 (round $ m * fromIntegral g1 + (1-m) * fromIntegral g2)

@@ -35,7 +35,7 @@ renderView :: TimelineState
            -> ViewParameters
            -> HECs -> TimeSelection -> [Timestamp]
            -> Region -> IO ()
-renderView TimelineState{timelineDrawingArea, timelineVAdj, timelinePrevView}
+renderView TimelineState{timelineDrawingArea, timelineVAdj, timelinePrevView, hintIORef}
            params hecs selection bookmarks exposeRegion = do
 
   -- Get state information from user-interface components
@@ -49,12 +49,13 @@ renderView TimelineState{timelineDrawingArea, timelineVAdj, timelinePrevView}
   win <- widgetGetDrawWindow timelineDrawingArea
   renderWithDrawable win $ do
 
+  hint <- liftIO $ readIORef hintIORef
   let renderToNewSurface = do
         new_surface <- withTargetSurface $ \surface ->
           liftIO $ createSimilarSurface surface ContentColor w (height params)
         renderWith new_surface $ do
           clearWhite
-          renderTraces params hecs rect
+          renderTraces params hecs hint rect
         return new_surface
 
   surface <-
@@ -74,10 +75,10 @@ renderView TimelineState{timelineDrawingArea, timelineVAdj, timelinePrevView}
                    fromIntegral (width params) * scaleValue params
                 -- and the views overlap...
                then
-                 scrollView surface old_params params hecs
+                 scrollView surface old_params params hecs hint
                else do
                  renderWith surface $ do
-                   clearWhite; renderTraces params hecs rect
+                   clearWhite; renderTraces params hecs hint rect
                  return surface
 
         | otherwise
@@ -174,9 +175,9 @@ timestampToView ViewParameters{scaleValue, hadjValue} ts =
 -------------------------------------------------------------------------------
 -- This function draws the current view of all the HECs with Cairo.
 
-renderTraces :: ViewParameters -> HECs -> Rectangle
+renderTraces :: ViewParameters -> HECs -> TimelineHint -> Rectangle
              -> Render ()
-renderTraces params@ViewParameters{..} hecs (Rectangle rx _ry rw _rh) = do
+renderTraces params@ViewParameters{..} hecs hint (Rectangle rx _ry rw _rh) = do
   let scale_rx    = fromIntegral rx * scaleValue
       scale_rw    = fromIntegral rw * scaleValue
       scale_width = fromIntegral width * scaleValue
@@ -226,7 +227,7 @@ renderTraces params@ViewParameters{..} hecs (Rectangle rx _ry rw _rh) = do
                renderSparkHistogram params hecs
              TraceGroup _ -> error "renderTrace"
              TraceActivity ->
-               renderActivity params hecs startPos endPos
+               renderActivity params hecs hint startPos endPos
           restore
         histTotalHeight = histogramHeight + histXScaleHeight
     -- Now render all the HECs.
@@ -239,8 +240,9 @@ renderTraces params@ViewParameters{..} hecs (Rectangle rx _ry rw _rh) = do
 scrollView :: Surface
            -> ViewParameters -> ViewParameters
            -> HECs
+           -> TimelineHint
            -> Render Surface
-scrollView surface old new hecs = do
+scrollView surface old new hecs hint = do
 --   scrolling on the same surface seems not to work, I get garbled results.
 --   Not sure what the best way to do this is.
 --   let new_surface = surface
@@ -278,7 +280,7 @@ scrollView surface old new hecs = do
     setSourceRGBA 0xffff 0xffff 0xffff 0xffff
     fill
 
-    renderTraces new hecs rect
+    renderTraces new hecs hint rect
 
   surfaceFinish surface
   return new_surface

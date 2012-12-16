@@ -1,10 +1,14 @@
 module GUI.Timeline.Types (
     TimelineState(..),
     TimeSelection(..),
+    TimelineHint(..)
  ) where
 
 
 import GUI.Types
+
+import Events.TimeTree (TimeTree)
+import Events.Debug (SampleWeight)
 
 import Graphics.UI.Gtk
 import Graphics.Rendering.Cairo
@@ -27,11 +31,18 @@ data TimelineState = TimelineState {
        scaleIORef          :: IORef Double,
 
        -- Maximal number of sparks/slice measured after every zoom to fit.
-       maxSpkIORef         :: IORef Double
+       maxSpkIORef         :: IORef Double,
+
+       -- | Hint data: Something that we should highlight about what
+       -- the timeline is showing to provide context
+       hintIORef           :: IORef TimelineHint
      }
 
 
 data TimeSelection = PointSelection Timestamp
                    | RangeSelection Timestamp Timestamp
+
+data TimelineHint = NoHint
+                  | ActivityHint (TimeTree SampleWeight) (TimeTree SampleWeight)
 
 -----------------------------------------------------------------------------

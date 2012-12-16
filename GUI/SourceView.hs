@@ -70,6 +70,7 @@ data FileView = FileView {
   }
 
 data SourceView = SourceView {
+  actions      :: SourceViewActions,
   stateRef     :: IORef SourceViewState,
   sourceBook   :: Notebook,
   coreView     :: GtkSourceView.SourceView,
@@ -177,7 +178,7 @@ symTabPrefix :: String
 symTabPrefix = "SYMTAB: "
 
 data SourceViewActions = SourceViewActions {
-  --sourceViewRedraw :: IO ()
+  sourceViewSetTimelineHint :: TimelineHint -> IO ()
   }
 
 
@@ -198,7 +199,7 @@ dumpTag tag = do
                            fromMaybe "no name" (tagName tag) ++ ": no dbg..."
 
 sourceViewNew :: Builder -> Options -> SourceViewActions -> IO SourceView
-sourceViewNew builder opts SourceViewActions{..} = do
+sourceViewNew builder opts actions = do
 
   let getWidget cast = builderGetObject builder cast
   sourceBook   <- getWidget castToNotebook "source_book"
@@ -385,14 +386,12 @@ sourceViewNew builder opts SourceViewActions{..} = do
   on coreBuffer markSet $ \iter mark -> do
     markName <- textMarkGetName mark
     when (markName == Just "insert") $ do
-      state@SourceViewState{lineTags} <- readIORef stateRef
+      SourceViewState{lineTags} <- readIORef stateRef
       -- Get top-level tag at given line
       line <- textIterGetLine iter
       case drop line lineTags of
-        ((tag:_):_) -> do
-          writeIORef stateRef state{hintSel=[tag]}
-          widgetQueueDraw srcTagsTreeView
-        _other -> return ()
+        ((tag:_):_) -> updateHint srcView [tag]
+        _other      -> return ()
   on sampleChooser changed $ do
     miter <- comboBoxGetActiveIter sampleChooser
     case miter of
@@ -833,7 +832,7 @@ updateFileBookLabels SourceView {stateRef, sourceBook} = do
 
 updateSrcTagSelection :: SourceView -> IO ()
 updateSrcTagSelection view@SourceView{..} = do
-  state@SourceViewState{..} <- readIORef stateRef
+  SourceViewState{..} <- readIORef stateRef
 
   -- Read selection from list view, write to state
   tagSelect <- treeViewGetSelection srcTagsTreeView
@@ -843,9 +842,8 @@ updateSrcTagSelection view@SourceView{..} = do
                     tag <- treeStoreGetValue srcTagsStore path
                     return (Just tag)
     Nothing   -> return Nothing
-  writeIORef stateRef state {
+  modifyIORef stateRef $ \s -> s {
     srcSel = select',
-    hintSel = maybe [] stagTags select',
     openEntries = nub . map getSubsumationEntry .
                   mapMaybe tagDebug $ maybe [] stagTags select'
     }
@@ -882,7 +880,10 @@ updateSrcTagSelection view@SourceView{..} = do
       updateFileBookLabels view
 
       -- Subsume tags
-      let tags = subsumeTagFamilies $ subsumeTags $ stagTags stag
+      let (roots, openNodes) = subsumeTagFamilies $ subsumeTags $ stagTags stag
+      modifyIORef stateRef $ \s -> s {
+        openEntries = openNodes
+        }
 
       -- Show cores
       clearCore view
@@ -892,6 +893,9 @@ updateSrcTagSelection view@SourceView{..} = do
         showCore view tag
         iter <- textBufferGetEndIter coreBuffer
         writeSource view iter [] "\n"
+
+      -- Show hints
+      updateHint view (stagTags stag)
 
       -- update activation due to new selection
       widgetQueueDraw srcTagsTreeView
@@ -918,6 +922,28 @@ setSrcTagSelection SourceView{..} (Just stag) = do
 sourceTagEquiv :: SourceTag -> SourceTag -> Bool
 sourceTagEquiv st1 st2
   = stagFile st1 == stagFile st2 && stagName st1 == stagName st2
+
+-------------------------------------------------------------------------------
+updateHint :: SourceView -> [Tag] -> IO ()
+updateHint SourceView{stateRef,actions,srcTagsTreeView} hint = do
+
+  -- Get the hints and all entries subsumed with them
+  let entries = [ e | tag <- hint
+                    , Just dbg <- [tagDebug tag]
+                    , e <- findSubsumedEntries dbg
+                    ]
+  SourceViewState{dbgMap,sampleType} <- readIORef stateRef
+
+  -- Get time trees for the samples in question - as well as the
+  -- total amount of samples, for comparison.
+  let sampleTimeTree = getSampleTimeTree dbgMap 0 sampleType SampleInstrPtr entries
+      sumTimeTree = getSumTimeTree dbgMap 0 sampleType SampleInstrPtr
+
+  -- Set hint
+  sourceViewSetTimelineHint actions $ ActivityHint sampleTimeTree sumTimeTree
+  modifyIORef stateRef $ \s -> s { hintSel = hint }
+  widgetQueueDraw srcTagsTreeView
+
 
 -------------------------------------------------------------------------------
 

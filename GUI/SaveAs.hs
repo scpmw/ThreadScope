@@ -4,6 +4,7 @@ module GUI.SaveAs (saveAsPDF, saveAsPNG) where
 import GUI.Timeline.Render (renderTraces, renderYScaleArea)
 import GUI.Timeline.Render.Constants
 import GUI.Timeline.Ticks (renderXScaleArea)
+import GUI.Timeline.Types
 import GUI.Types
 import Events.HECs
 
@@ -23,7 +24,7 @@ saveAs hecs params' @ViewParameters{xScaleAreaHeight, width,
                }
       w = ceiling yScaleAreaWidth + width
       h = xScaleAreaHeight + height
-      drawTraces = renderTraces params hecs (Rectangle 0 0 width height)
+      drawTraces = renderTraces params hecs NoHint (Rectangle 0 0 width height)
       drawXScale = renderXScaleArea params hecs
       drawYScale = renderYScaleArea params hecs yScaleArea
       -- Functions renderTraces and renderXScaleArea draw to the left of 0

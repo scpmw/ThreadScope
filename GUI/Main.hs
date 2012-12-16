@@ -30,6 +30,7 @@ import GUI.SummaryView
 import GUI.StartupInfoView
 import GUI.Histogram
 import GUI.Timeline
+import GUI.Timeline.Types
 import GUI.TraceView
 import GUI.BookmarkView
 import GUI.KeyView
@@ -103,6 +104,7 @@ data Event
    | EventTimelineZoomToFit
    | EventTimelineLabelsMode Bool
    | EventTimelineShowBW     Bool
+   | EventTimelineSetHint TimelineHint
 
    | EventSwitchPage MainWindow.MainWindowPage
 
@@ -167,7 +169,9 @@ constructUI opts = failOnGError $ do
     traceViewTracesChanged = post . EventTracesChanged
   }
 
-  sourceView <- sourceViewNew builder opts SourceViewActions {}
+  sourceView <- sourceViewNew builder opts SourceViewActions {
+   sourceViewSetTimelineHint = post . EventTimelineSetHint
+  }
 
   bookmarkView <- bookmarkViewNew builder BookmarkViewActions {
     bookmarkViewAddBookmark    = post EventBookmarkAdd,
@@ -353,6 +357,10 @@ eventLoop uienv@UIEnv{..} eventlogState = do
 
     dispatch (EventTimelineShowBW showBW) _ = do
       timelineSetBWMode timelineWin showBW
+      continue
+
+    dispatch (EventTimelineSetHint hint) _ = do
+      timelineSetHint timelineWin hint
       continue
 
     dispatch (EventCursorChangedIndex cursorPos') EventlogLoaded{hecs} = do

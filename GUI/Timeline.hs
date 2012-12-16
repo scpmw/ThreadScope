@@ -11,6 +11,7 @@ module GUI.Timeline (
     timelineWindowSetHECs,
     timelineWindowSetTraces,
     timelineWindowSetBookmarks,
+    timelineSetHint,
     timelineSetSelection,
     TimeSelection(..),
 
@@ -129,6 +130,12 @@ timelineWindowSetBookmarks timelineWin@TimelineView{bookmarkIORef} bookmarks = d
   writeIORef bookmarkIORef bookmarks
   timelineParamsChanged timelineWin
 
+timelineSetHint :: TimelineView -> TimelineHint -> IO ()
+timelineSetHint timelineWin@TimelineView{timelineState} hint = do
+  writeIORef (hintIORef timelineState) hint
+  writeIORef (timelinePrevView timelineState) Nothing
+  timelineParamsChanged timelineWin
+
 -----------------------------------------------------------------------------
 
 timelineViewNew :: Builder -> TimelineViewActions -> IO TimelineView
@@ -158,6 +165,7 @@ timelineViewNew builder actions@TimelineViewActions{..} = do
   bookmarkIORef <- newIORef []
   scaleIORef  <- newIORef 0
   maxSpkIORef <- newIORef 0
+  hintIORef   <- newIORef NoHint
   selectionRef <- newIORef (PointSelection 0)
   bwmodeIORef <- newIORef False
   labelsModeIORef <- newIORef False

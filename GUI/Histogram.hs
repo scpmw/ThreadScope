@@ -8,6 +8,7 @@ module GUI.Histogram (
 import Events.HECs
 import GUI.Timeline.Render (renderTraces, renderYScaleArea)
 import GUI.Timeline.Render.Constants
+import GUI.Timeline.Types
 import GUI.Types
 
 import Graphics.UI.Gtk
@@ -104,7 +105,7 @@ histogramViewNew builder = do
                        params = paramsHist size minterval
                        rect = Rectangle 0 0 w (snd size)
                    renderWithDrawable win $
-                     renderTraces params hecs rect
+                     renderTraces params hecs NoHint rect
                    return True
 
   -- Redrawing histogramYScaleArea

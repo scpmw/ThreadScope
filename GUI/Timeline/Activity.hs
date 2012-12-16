@@ -3,10 +3,12 @@ module GUI.Timeline.Activity (
   ) where
 
 import GUI.Timeline.Render.Constants
+import GUI.Timeline.Types
 
 import Events.HECs
 import Events.EventTree
-import Events.EventDuration
+import Events.TimeTree
+import Events.Debug (SampleWeight(..))
 import GUI.Types
 import GUI.ViewerColours
 
@@ -21,10 +23,10 @@ import Data.List
 
 -----------------------------------------------------------------------------
 
-renderActivity :: ViewParameters -> HECs -> Timestamp -> Timestamp
+renderActivity :: ViewParameters -> HECs -> TimelineHint -> Timestamp -> Timestamp
                -> Render ()
 
-renderActivity ViewParameters{..} hecs start0 end0 = do
+renderActivity ViewParameters{..} hecs hint start0 end0 = do
   let
       slice = ceiling (fromIntegral activity_detail * scaleValue)
 
@@ -36,9 +38,14 @@ renderActivity ViewParameters{..} hecs start0 end0 = do
                      (map (\ (t, _, _) -> t) (hecTrees hecs))
       total_prof = map sum (transpose hec_profs)
 
+      hint_prof = case hint of
+        ActivityHint hintTree totalTree
+               -> hintProfile slice start end hintTree totalTree
+        _other -> []
+
 --  liftIO $ printf "%s\n" (show (map length hec_profs))
 --  liftIO $ printf "%s\n" (show (map (take 20) hec_profs))
-  drawActivity hecs start end slice total_prof
+  drawActivity hecs start end slice total_prof hint_prof
                (if not bwMode then runningColour else black)
 
 activity_detail :: Int
@@ -64,17 +71,34 @@ actProfile slice start end t
                | otherwise  = 0
       in OverviewNode time 0
 
+-- for each time slice, the percentage of activity that should be hinted at
+hintProfile :: Timestamp -> Timestamp -> Timestamp
+              -> TimeTree SampleWeight -> TimeTree SampleWeight -> [Double]
+hintProfile slice start end hintTree totalTree
+  | start < slice  = 0 : mkProf start
+  | otherwise      = mkProf (start - slice)
   where
+    mkProf start' = zipWith calcHint (slice_f start' hintTree) (slice_f start' totalTree)
+    slice_f start' = sliceTimeTree clamp (start', end+slice) slice
+    -- In contrast to above, we assume that weights are distributed
+    -- uniformely over the period.
+    clamp (oldl, oldr) (newl, newr) (SampleWeight w) =
+      let old_len = oldr - oldl
+          new_len = newr - newl
+      in SampleWeight $ w * new_len `div` old_len
 
-drawActivity :: HECs -> Timestamp -> Timestamp -> Timestamp -> [Timestamp]
+    calcHint hintSTree totalSTree =
+      let hint = unSampleWeight $ timeTreeVal hintSTree
+          total = unSampleWeight $ timeTreeVal totalSTree
+      in case total of
+        0 -> 0
+        _ -> fromIntegral hint / fromIntegral total
+
+drawActivity :: HECs -> Timestamp -> Timestamp -> Timestamp -> [Timestamp] -> [Double]
              -> Color
              -> Render ()
-drawActivity hecs start end slice ts color = do
-  case ts of
-   [] -> return ()
-   t:ts -> do
---     liftIO $ printf "ts: %s\n" (show (t:ts))
---     liftIO $ printf "off: %s\n" (show (map off (t:ts) :: [Double]))
+drawActivity hecs start end slice ts hints color = do
+
      let dstart = fromIntegral start
          dend   = fromIntegral end
          dslice = fromIntegral slice
@@ -105,7 +129,15 @@ drawActivity hecs start end slice ts color = do
      setLineWidth 1
      strokePreserve
      setSourceRGBAhex color 1.0
+
+     -- First the actual activity graph
      graphPath ts
+     fill
+
+     -- Then draw hint over it (if any)
+     setSourceRGBAhex green 1.0
+     let calcHint t h = round (fromIntegral t * h)
+     graphPath $ zipWith calcHint ts hints
      fill
 
 -- funky gradients don't seem to work:

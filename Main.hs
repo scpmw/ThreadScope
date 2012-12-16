@@ -7,7 +7,7 @@ import System.Environment
 import System.Exit
 import System.Console.GetOpt
 import Data.Version (showVersion)
-import Paths_threadscope (version)
+import Paths_threadscope_pmw (version)
 
 -------------------------------------------------------------------------------
 

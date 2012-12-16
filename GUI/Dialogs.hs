@@ -1,6 +1,6 @@
 module GUI.Dialogs where
 
-import Paths_threadscope (getDataFileName, version)
+import Paths_threadscope_pmw (getDataFileName, version)
 
 import Graphics.UI.Gtk
 

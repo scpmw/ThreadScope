@@ -54,7 +54,7 @@ import Control.Exception (catch, IOException)
 
 import Text.Printf
 
-import Paths_threadscope (getDataFileName)
+import Paths_threadscope_pmw (getDataFileName)
 
 -------------------------------------------------------------------------------
 

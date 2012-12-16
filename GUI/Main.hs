@@ -16,7 +16,7 @@ import Control.Exception
 import Data.Array
 import Data.Maybe
 
-import Paths_threadscope
+import Paths_threadscope_pmw
 
 -- Imports for ThreadScope
 import qualified GUI.MainWindow as MainWindow

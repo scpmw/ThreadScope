@@ -12,7 +12,7 @@ module GUI.MainWindow (
 
   ) where
 
-import Paths_threadscope
+import Paths_threadscope_pmw
 
 -- Imports for GTK
 import Graphics.UI.Gtk as Gtk

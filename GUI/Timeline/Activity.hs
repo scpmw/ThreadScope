@@ -44,66 +44,27 @@ renderActivity ViewParameters{..} hecs start0 end0 = do
 activity_detail :: Int
 activity_detail = 4 -- in pixels
 
--- for each timeslice, the amount of time spent in the mutator
--- during that period.
+-- for each timeslice in the period (and one outside at each end), the
+-- amount of time spent in the mutator during that period.
 actProfile :: Timestamp -> Timestamp -> Timestamp -> DurationTree -> [Timestamp]
-actProfile slice start0 end0 t
-  = {- trace (show flat) $ -} chopped
+actProfile slice start end t
+  | start < slice  = 0 : mkProf start t
+  | otherwise      = mkProf (start - slice) t
+  where
+    mkProf start' = map (runTimeOf . timeTreeVal) .
+                    sliceTimeTree clamp (start', end+slice) slice
+    -- The clamp function will only ever get used on leaf nodes,
+    -- therefore we can assume that all the cost happens at the
+    -- *beginning* of the old interval. We build a new node
+    -- accordingly. Note that we drop GC times when clamping nodes, as
+    -- we are only interested in mutator cost.
+    clamp (oldl, _) (newl, newr) v =
+      let x = oldl + runTimeOf v
+          time | x >= newl  = (x - newl) `min` (newr - newl)
+               | otherwise  = 0
+      in OverviewNode time 0
 
   where
-   -- do an extra slice at both ends
-   start = if start0 < slice then start0 else start0 - slice
-   end   = end0 + slice
-
-   flat = flatten start t []
-   chopped0 = chop 0 start flat
-
-   chopped | start0 < slice = 0 : chopped0
-           | otherwise      = chopped0
-
-   flatten :: Timestamp -> DurationTree -> [DurationTree] -> [DurationTree]
-   flatten _start DurationTreeEmpty rest = rest
-   flatten start t@(DurationSplit s split e l r _run _) rest
-     | e   <= start   = rest
-     | end <= s       = rest
-     | start >= split = flatten start r rest
-     | end   <= split = flatten start l rest
-     | e - s > slice  = flatten start l $ flatten start r rest
-     | otherwise      = t : rest
-   flatten _start t@(DurationTreeLeaf _) rest
-     = t : rest
-
-   chop :: Timestamp -> Timestamp -> [DurationTree] -> [Timestamp]
-   chop sofar start _ts
-     | start >= end = if sofar > 0 then [sofar] else []
-   chop sofar start []
-     = sofar : chop 0 (start+slice) []
-   chop sofar start (t : ts)
-     | e <= start
-     = if sofar /= 0
-          then error "chop"
-          else chop sofar start ts
-     | s >= start + slice
-     = sofar : chop 0 (start + slice) (t : ts)
-     | e > start + slice
-     = (sofar + time_in_this_slice t) : chop 0 (start + slice) (t : ts)
-     | otherwise
-     = chop (sofar + time_in_this_slice t) start ts
-    where
-      (s, e)
-        | DurationTreeLeaf ev <- t           = (startTimeOf ev, endTimeOf ev)
-        | DurationSplit s _ e _ _ _run _ <- t = (s, e)
-
-      mi = min (start + slice) e
-      ma = max start s
-      duration = if mi < ma then 0 else mi - ma
-
-      time_in_this_slice t = case t of
-        DurationTreeLeaf ThreadRun{}  -> duration
-        DurationTreeLeaf _            -> 0
-        DurationSplit _ _ _ _ _ run _ ->
-          round (fromIntegral (run * duration) / fromIntegral (e-s))
-        DurationTreeEmpty             -> error "time_in_this_slice"
 
 drawActivity :: HECs -> Timestamp -> Timestamp -> Timestamp -> [Timestamp]
              -> Color
@@ -127,16 +88,24 @@ drawActivity hecs start end slice ts color = do
 --        setSource pattern
 --        fill
 
-     newPath
-     moveTo (dstart-dslice/2) (off t)
-     zipWithM_ lineTo (tail [dstart-dslice/2, dstart+dslice/2 ..]) (map off ts)
+     -- Path for a profile
+     let off t = fromIntegral activityGraphHeight -
+            fromIntegral (t * fromIntegral activityGraphHeight) /
+            fromIntegral (fromIntegral (hecCount hecs) * slice)
+         graphPath [] = return ()
+         graphPath (t:ts) = do
+           newPath
+           moveTo (dstart-dslice/2) (off t)
+           zipWithM_ lineTo (tail [dstart-dslice/2, dstart+dslice/2 ..]) (map off ts)
+           lineTo dend   dheight
+           lineTo dstart dheight
+
+     -- Set up for drawing graph
      setSourceRGBAhex black 1.0
      setLineWidth 1
      strokePreserve
-
-     lineTo dend   dheight
-     lineTo dstart dheight
      setSourceRGBAhex color 1.0
+     graphPath ts
      fill
 
 -- funky gradients don't seem to work:
@@ -160,9 +129,6 @@ drawActivity hecs start end slice ts color = do
      restore
 
  where
-  off t = fromIntegral activityGraphHeight -
-            fromIntegral (t * fromIntegral activityGraphHeight) /
-            fromIntegral (fromIntegral (hecCount hecs) * slice)
 
 -- | Draw a dashed line along the current path.
 dashedLine1 :: Render ()

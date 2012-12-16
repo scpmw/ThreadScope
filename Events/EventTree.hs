@@ -1,5 +1,5 @@
 module Events.EventTree (
-     DurationTree(..),
+     DurationTree, DurationNode(..),
      mkDurationTree,
 
      runTimeOf, gcTimeOf,
@@ -12,6 +12,7 @@ module Events.EventTree (
      reportEventTree, eventTreeMaxDepth,
   ) where
 
+import Events.TimeTree
 import Events.EventDuration
 
 import qualified GHC.RTS.Events as GHC
@@ -19,6 +20,7 @@ import GHC.RTS.Events hiding (Event)
 
 import Text.Printf
 import Control.Exception (assert)
+import Data.Monoid
 
 -------------------------------------------------------------------------------
 
@@ -35,109 +37,43 @@ import Control.Exception (assert)
 -- by time, the actual split depends on the distribution of events
 -- below it.
 
-data DurationTree
-  = DurationSplit
-        {-#UNPACK#-}!Timestamp -- The start time of this run-span
-        {-#UNPACK#-}!Timestamp -- The time used to split the events into two parts
-        {-#UNPACK#-}!Timestamp -- The end time of this run-span
-        DurationTree -- The LHS split; all events lie completely between
-                     -- start and split
-        DurationTree -- The RHS split; all events lie completely between
-                     -- split and end
+data DurationNode
+  = OverviewNode
         {-#UNPACK#-}!Timestamp -- The total amount of time spent running a thread
         {-#UNPACK#-}!Timestamp -- The total amount of time spend in GC
-
-  | DurationTreeLeaf
+  | DurationNode
         EventDuration
 
-  | DurationTreeEmpty
+instance Monoid DurationNode where
+  mempty        = OverviewNode 0 0
+  n `mappend` m = OverviewNode (runTimeOf n + runTimeOf m) (gcTimeOf n + gcTimeOf m)
 
-  deriving Show
+instance Show DurationNode where
+  show n = "Run " ++ show (runTimeOf n) ++ " ms, GC " ++ show (gcTimeOf n) ++ " ms"
+
+type DurationTree = TimeTree DurationNode
 
 -------------------------------------------------------------------------------
 
 mkDurationTree :: [EventDuration] -> Timestamp -> DurationTree
-mkDurationTree es endTime =
-  -- trace (show tree) $
-  tree
- where
-  tree = splitDurations es endTime
-
-splitDurations :: [EventDuration] -- events
-               -> Timestamp       -- end time of last event in the list
-               -> DurationTree
-splitDurations [] _endTime =
-  -- if len /= 0 then error "splitDurations0" else
-  DurationTreeEmpty  -- The case for an empty list of events.
-
-splitDurations [e] _entTime =
-  DurationTreeLeaf e
-
-splitDurations es endTime
-  | null rhs
-  = splitDurations es lhs_end
-
-  | null lhs
-  = error $
-    printf "splitDurations: null lhs: len = %d, startTime = %d, endTime = %d\n"
-      (length es) startTime endTime
-    ++ '\n': show es
-
-  | otherwise
-  = -- trace (printf "len = %d, startTime = %d, endTime = %d, lhs_len = %d\n" len startTime endTime lhs_len) $
-    assert (length lhs + length rhs == length es) $
-    DurationSplit startTime
-               lhs_end
-               endTime
-               ltree
-               rtree
-               runTime
-               gcTime
-    where
-    startTime = startTimeOf (head es)
-    splitTime = startTime + (endTime - startTime) `div` 2
-
-    (lhs, lhs_end, rhs) = splitDurationList es [] splitTime 0
-
-    ltree = splitDurations lhs lhs_end
-    rtree = splitDurations rhs endTime
-
-    runTime = runTimeOf ltree + runTimeOf rtree
-    gcTime  = gcTimeOf  ltree + gcTimeOf  rtree
-
-
-splitDurationList :: [EventDuration]
-                  -> [EventDuration]
-                  -> Timestamp
-                  -> Timestamp
-                  -> ([EventDuration], Timestamp, [EventDuration])
-splitDurationList []  acc !_tsplit !tmax
-  = (reverse acc, tmax, [])
-splitDurationList [e] acc !_tsplit !tmax
-  -- Just one event left: put it on the right. This ensures that we
-  -- have at least one event on each side of the split.
-  = (reverse acc, tmax, [e])
-splitDurationList (e:es) acc !tsplit !tmax
-  | tstart <= tsplit  -- pick all events that start at or before the split
-  = splitDurationList es (e:acc) tsplit (max tmax tend)
-  | otherwise
-  = (reverse acc, tmax, e:es)
-  where
-    tstart = startTimeOf e
-    tend   = endTimeOf e
+mkDurationTree es endTime = mkTimeTree nodes endTime
+  where nodes = map stamp $ filter ((>0) . durationOf) es
+        stamp d = (startTimeOf d, DurationNode d)
+        -- PMW: Filter out all zero-length nodes. I suppose they wouldn't
+        --      have any effect either way?
 
 -------------------------------------------------------------------------------
 
-runTimeOf :: DurationTree -> Timestamp
-runTimeOf (DurationSplit _ _ _ _ _ runTime _) = runTime
-runTimeOf (DurationTreeLeaf e) | ThreadRun{} <- e = durationOf e
+runTimeOf :: DurationNode -> Timestamp
+runTimeOf (OverviewNode runTime _) = runTime
+runTimeOf (DurationNode e) | ThreadRun{} <- e = durationOf e
 runTimeOf _ = 0
 
 -------------------------------------------------------------------------------
 
-gcTimeOf :: DurationTree -> Timestamp
-gcTimeOf (DurationSplit _ _ _ _ _ _ gcTime) = gcTime
-gcTimeOf (DurationTreeLeaf e) | isGCDuration e = durationOf e
+gcTimeOf :: DurationNode -> Timestamp
+gcTimeOf (OverviewNode _ gcTime) = gcTime
+gcTimeOf (DurationNode e) | isGCDuration e = durationOf e
 gcTimeOf _ = 0
 
 -------------------------------------------------------------------------------
@@ -152,16 +88,12 @@ reportDurationTree hecNumber eventTree
 -------------------------------------------------------------------------------
 
 durationTreeCountNodes :: DurationTree -> Int
-durationTreeCountNodes (DurationSplit _ _ _ lhs rhs _ _)
-   = 1 + durationTreeCountNodes lhs + durationTreeCountNodes rhs
-durationTreeCountNodes _ = 1
+durationTreeCountNodes = timeTreeSize
 
 -------------------------------------------------------------------------------
 
 durationTreeMaxDepth :: DurationTree -> Int
-durationTreeMaxDepth (DurationSplit _ _ _ lhs rhs _ _)
-  = 1 + durationTreeMaxDepth lhs `max` durationTreeMaxDepth rhs
-durationTreeMaxDepth _ = 1
+durationTreeMaxDepth = timeTreeMaxDepth
 
 -------------------------------------------------------------------------------
 

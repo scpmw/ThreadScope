@@ -54,7 +54,7 @@ rawEventsToHECs eventList endTime
   where
     heclists = [ (h, events) | (Just h, events) <- eventList ]
 
-    toTree Nothing    = (0, (DurationTreeEmpty,
+    toTree Nothing    = (0, (mkDurationTree [] 0,
                              EventTree 0 0 (EventTreeLeaf []),
                              emptySparkTree))
     toTree (Just evs) =

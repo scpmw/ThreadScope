@@ -6,6 +6,7 @@ module GUI.Timeline.HEC (
 import GUI.Timeline.Render.Constants
 
 import Events.EventTree
+import Events.TimeTree
 import Events.EventDuration
 import GUI.Types
 import GUI.Timeline.CairoDrawing
@@ -48,26 +49,22 @@ renderDurations :: ViewParameters
                 -> Timestamp -> Timestamp -> DurationTree
                 -> Render ()
 
-renderDurations _ _ _ DurationTreeEmpty = return ()
-
-renderDurations params@ViewParameters{..} startPos endPos (DurationTreeLeaf e)
-  | inView startPos endPos e = drawDuration params e
-  | otherwise                = return ()
-
-renderDurations params@ViewParameters{..} !startPos !endPos
-        (DurationSplit s splitTime e lhs rhs runAv gcAv)
-  | startPos < splitTime && endPos >= splitTime &&
-          (fromIntegral (e - s) / scaleValue) <= fromIntegral detail
-  = -- View spans both left and right sub-tree.
-    -- trace (printf "hecView (average): start:%d end:%d s:%d e:%d" startPos endPos s e) $
-    drawAverageDuration params s e runAv gcAv
-
-  | otherwise
-  = -- trace (printf "hecView: start:%d end:%d s:%d e:%d" startPos endPos s e) $
-    do when (startPos < splitTime) $
-         renderDurations params startPos endPos lhs
-       when (endPos >= splitTime) $
-         renderDurations params startPos endPos rhs
+renderDurations params@ViewParameters{..} !startPos !endPos tree
+  | notVisible        = return ()
+  | timeTreeNull tree = return ()
+  | timeTreeLeaf tree =
+         let DurationNode e = val
+         in drawDuration params e
+  | drawSize < fromIntegral detail =
+         drawAverageDuration params start end (runTimeOf val) (gcTimeOf val)
+  | otherwise = do
+         renderDurations params startPos endPos (timeTreeLeft tree)
+         renderDurations params startPos endPos (timeTreeRight tree)
+ where start = timeTreeStart tree
+       end   = timeTreeEnd tree
+       drawSize = fromIntegral (end - start) / scaleValue
+       notVisible = start > endPos || end < startPos
+       val = timeTreeVal tree
 
 -------------------------------------------------------------------------------
 
@@ -110,16 +107,6 @@ renderEvents params@ViewParameters{..} !s !e !startPos !endPos ewidth
          then renderEvents params splitTime e startPos endPos ewidth rhs
          else return False
        return $ drawnLhs || drawnRhs
-
--------------------------------------------------------------------------------
--- An event is in view if it is not outside the view.
-
-inView :: Timestamp -> Timestamp -> EventDuration -> Bool
-inView viewStart viewEnd event =
-  not (eStart > viewEnd || eEnd <= viewStart)
- where
-  eStart = startTimeOf event
-  eEnd   = endTimeOf event
 
 -------------------------------------------------------------------------------
 

@@ -634,11 +634,12 @@ sourceViewAdjustSelection SourceView{..} (PointSelection sel) = do
 
   -- We can't really work with a point selection, so let's "enhance"
   -- the selection until we have a "good" amount of samples
-  let goodAmountOfSamples = 100
+  let goodAmountOfSamples = 1000
 
-  SourceViewState{eventsArr} <- readIORef stateRef
-  let countSamples CapEvent{ce_event=Event{spec=InstrPtrSample{ips}}}
-                     = snd $ UA.bounds ips
+  SourceViewState{eventsArr,sampleType} <- readIORef stateRef
+  let countSamples CapEvent{ce_event=Event{spec=Samples{weights,sample_by}}}
+                     | sample_by == sampleType
+                     = sum $ UA.elems weights
       countSamples _ = 0
       (_, bound)     = bounds eventsArr
       findEnd i !samples

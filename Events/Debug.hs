@@ -63,6 +63,7 @@ data DebugEntry = DebugEntry {
   dbgDName  :: Maybe BS.ByteString,
   dbgInstr  :: Maybe Int,
   dbgParent :: Maybe DebugEntry,
+  dbgChilds :: [DebugEntry],
   dbgSources:: [Span],
   dbgDCore  :: Maybe DebugEntryCore
   }
@@ -95,7 +96,7 @@ buildDebugMaps eventsArr progress = do
   progress "Reading debug data..."
 
   -- Load debug data from event log
-  let dbgMap = buildDbgMap eventsArr
+  let (dbgMap, startIx) = buildDbgMap eventsArr
   putStrLn $ printf "Debug data has %d procedures" (length dbgMap)
   -- mapM_ dumpDebug dbgMap
 
@@ -126,62 +127,70 @@ dumpDebug DebugEntry{..} = do
     show (length dbgSources) ++ " source ranges, " ++
     (maybe "no core" (("core " ++) . show . dbgCoreCode) dbgDCore)
 
-buildDbgMap :: Array Int CapEvent -> DbgMap
-buildDbgMap arr = dbgMap
+buildDbgMap :: Array Int CapEvent -> (DbgMap, Int)
+buildDbgMap arr = result
   where
-    (imap, dbgMap) = go (BS.empty) 0 0 imap (IM.empty) (elems arr) []
+    (start, end) = bounds arr
+    (maps, result) = go start (BS.empty) 0 0 maps (IM.empty, IM.empty) []
 
     -- The somewhat complicated knot tying here is a bit silly, given
     -- that at some point we want to have unique instrumentation IDs
     -- anyway. However, as currently the offset stuff doesn't seem to work,
     -- we work around that by building one IntMap per module.
 
-    go _     _     _ _     iMapO []     xs = (iMapO, xs)
-    go mfile moff !i iMapI iMapO (e:es) xs = case spec $ ce_event e of
-      CreateThread {}
-        -> (iMapO, xs) -- Don't expect any further debug data
-      DebugModule { file }
-        -> let res = go file moff i (fst res) IM.empty es xs
-           in (iMapO, snd res)
-      DebugProcedure { instr, parent, label }
-        -> let (!srcs, !ranges, !core) = go_proc [] [] Nothing es
-               p_entry = parent >>= flip IM.lookup iMapI . fI
-               name = case find ((== mfile) . fileName) srcs of
-                 Just span              -> Just $ spanName span
-                 Nothing | null srcs    -> Nothing
-                         | otherwise    -> Just $ spanName $ head srcs
-               !entry = DebugEntry { dbgId = i
-                                   , dbgUnit = mfile
-                                   , dbgLabel = label
-                                   , dbgRanges = ranges
-                                   , dbgDName = name
-                                   , dbgInstr = fmap (fI.(+moff).fI) instr
-                                   , dbgParent = p_entry
-                                   , dbgSources = srcs
-                                   , dbgDCore = core
-                                   }
-               !iMapO' = case instr of
-                 Just ix -> IM.insert (fI ix) entry iMapO
-                 Nothing -> iMapO
-           in go mfile moff (i+1) iMapI iMapO' es (entry:xs)
-      _other -> go mfile moff i iMapI iMapO es xs
+    go n mfile moff !i ~(iMapI, cMapI) (iMapO, cMapO) xs
+      | n > end   = ((iMapO, cMapO), (xs, n))
+      | otherwise = case spec $ ce_event $ arr ! n of
+        CreateThread {}
+          -> ((iMapO, cMapO), (xs, n)) -- Don't expect any further debug data
+        DebugModule { file }
+          -> let res = go (n+1) file moff i (fst res) (IM.empty, IM.empty) xs
+             in ((iMapO, cMapO), snd res)
+        DebugProcedure { instr, parent, label }
+          -> let (!n', !srcs, !ranges, !core) = go_proc (n+1) [] [] Nothing
+                 parent_entry = do pid <- parent
+                                   IM.lookup (fI pid) iMapI
+                 child_entries = fromMaybe [] $ do id <- instr
+                                                   IM.lookup (fI id) cMapI
+                 name = case find ((== mfile) . fileName) srcs of
+                   Just span              -> Just $ spanName span
+                   Nothing | null srcs    -> Nothing
+                           | otherwise    -> Just $ spanName $ head srcs
+                 !entry = DebugEntry { dbgId = i
+                                     , dbgUnit = mfile
+                                     , dbgLabel = label
+                                     , dbgRanges = ranges
+                                     , dbgDName = name
+                                     , dbgInstr = fmap (fI.(+moff).fI) instr
+                                     , dbgParent = parent_entry
+                                     , dbgChilds = child_entries
+                                     , dbgSources = srcs
+                                     , dbgDCore = core
+                                     }
+                 !iMapO' = case instr of
+                   Just ix -> IM.insert (fI ix) entry iMapO
+                   Nothing -> iMapO
+                 !cMapO' = case parent of
+                   Just pix -> IM.insertWith (++) (fI pix) [entry] cMapO
+                   Nothing  -> cMapO
+             in go n' mfile moff (i+1) (iMapI, cMapI) (iMapO', cMapO') (entry:xs)
+        _other -> go (n+1) mfile moff i (iMapI, cMapI) (iMapO, cMapO) xs
 
-    go_proc srcs ranges core [] = (reverse srcs, ranges, core)
-    go_proc srcs ranges core (e:es) = case spec (ce_event e) of
-      DebugSource { sline, scol, eline, ecol, file, name=name' }
-        -> let !span = Span file name' (fI sline) (fI scol) (fI eline) (fI ecol)
-           in go_proc (span:srcs) ranges core es
-      DebugPtrRange { low, high }
-        -> go_proc srcs (IPRange (fromIntegral low) (fromIntegral high):ranges) core es
-      DebugCore { coreBind, coreCons, coreCode }
-        | not $ isJust core
-        -> let core' = DebugEntryCore coreBind coreCons (getCoreExpr coreCode)
-           in go_proc srcs ranges (Just core') es
-      DebugProcedure {} -> stop
-      CreateThread {} -> stop
-      _other
-        -> go_proc srcs ranges core es
-      where stop = (reverse srcs, ranges, core)
+    go_proc n srcs ranges core
+      | n > end   = (n, reverse srcs, ranges, core)
+      | otherwise = case spec $ ce_event $ arr ! n of
+        DebugSource { sline, scol, eline, ecol, file, name=name' }
+          -> let !span = Span file name' (fI sline) (fI scol) (fI eline) (fI ecol)
+             in go_proc (n+1) (span:srcs) ranges core
+        DebugPtrRange { low, high }
+          -> go_proc (n+1) srcs (IPRange (fromIntegral low) (fromIntegral high):ranges) core
+        DebugCore { coreBind, coreCons, coreCode }
+          | not $ isJust core
+          -> let core' = DebugEntryCore coreBind coreCons (getCoreExpr coreCode)
+             in go_proc (n+1) srcs ranges (Just core')
+        _other
+          -> stop
+      where stop = (n, reverse srcs, ranges, core)
 
     fI :: (Integral a, Integral b) => a -> b
     fI = fromIntegral

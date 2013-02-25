@@ -74,6 +74,8 @@ traceViewNew builder actions = do
     renderTrace (TraceHistogram)         = "Spark Histogram"
     renderTrace (TraceGroup       label) = label
     renderTrace (TraceActivity)          = "Activity Profile"
+    renderTrace TraceTasks               = "Tasks"
+
 
     updateChildren tracesStore path subtrees visibility' =
       sequence_
@@ -126,6 +128,7 @@ traceViewSetHECs TraceView{tracesStore} hecs = do
                   subForest = [ Node { rootLabel = (TracePoolHEC k, Hidden),
                                        subForest = [] }
                               | k <- [ 0 .. hecCount hecs - 1 ] ] }
+    nTas = Node { rootLabel = (TraceTasks, Hidden), subForest = [] }
     go n = do
       m <- treeStoreLookup tracesStore [n]
       case m of
@@ -133,6 +136,7 @@ traceViewSetHECs TraceView{tracesStore} hecs = do
           treeStoreInsertTree tracesStore [] 0 nPoo
           treeStoreInsertTree tracesStore [] 0 nCon
           treeStoreInsertTree tracesStore [] 0 nCre
+          treeStoreInsertTree tracesStore [] 0 nTas
           treeStoreInsertTree tracesStore [] 0 newI
           treeStoreInsertTree tracesStore [] 0 newT
         Just t  ->

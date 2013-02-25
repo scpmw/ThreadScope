@@ -28,6 +28,7 @@ data Trace
   | TraceHistogram
   | TraceGroup    String
   | TraceActivity
+  | TraceTasks
   -- more later ...
   --  | TraceThread   ThreadId
   deriving Eq

@@ -928,10 +928,7 @@ updateHint :: SourceView -> [Tag] -> IO ()
 updateHint SourceView{stateRef,actions,srcTagsTreeView} hint = do
 
   -- Get the hints and all entries subsumed with them
-  let entries = [ e | tag <- hint
-                    , Just dbg <- [tagDebug tag]
-                    , e <- findSubsumedEntries dbg
-                    ]
+  let entries = mapMaybe tagDebug hint
   SourceViewState{dbgMap,sampleType} <- readIORef stateRef
 
   -- Get time trees for the samples in question - as well as the
@@ -1587,8 +1584,7 @@ getSubsumationEntry entry = case dbgParent entry of
 -- entry
 findSubsumedEntries :: DebugEntry -> [DebugEntry]
 findSubsumedEntries = go . getSubsumationEntry
-  where go entry = trace ("blubber id="++show(dbgId entry) ++" cids="++show(map(dbgLabel) (filter shouldSubsume $ dbgChilds entry))) $
-                   entry : concatMap go (filter shouldSubsume $ dbgChilds entry)
+  where go entry = entry : concatMap go (filter shouldSubsume $ dbgChilds entry)
 
 -- | From a number of selected entries, generate roots of covering
 -- sub-trees and a list of all "open" entries

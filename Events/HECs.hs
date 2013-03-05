@@ -14,6 +14,7 @@ module Events.HECs (
 
 import Events.EventTree
 import Events.SparkTree
+import Events.Tasks
 import GHC.RTS.Events
 
 import Data.Array
@@ -32,7 +33,9 @@ data HECs = HECs {
        minXHistogram    :: Int,
        maxXHistogram    :: Int,
        maxYHistogram    :: Timestamp,
-       durHistogram     :: [(Timestamp, Int, Timestamp)]
+       durHistogram     :: [(Timestamp, Int, Timestamp)],
+       taskGraph        :: TaskGraph,
+       taskLayout       :: TaskLayout
      }
 
 -----------------------------------------------------------------------------

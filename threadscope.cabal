@@ -60,6 +60,7 @@ Executable threadscope-pmw
                      Events.TestEvents,
                      Events.Core,
                      Events.Debug,
+                     Events.Tasks,
                      GUI.Main,
                      GUI.MainWindow,
                      GUI.EventsView,
@@ -83,6 +84,7 @@ Executable threadscope-pmw
                      GUI.Timeline.Motion,
                      GUI.Timeline.Render,
                      GUI.Timeline.Sparks,
+                     GUI.Timeline.Tasks,
                      GUI.Timeline.Ticks,
                      GUI.Timeline.Types,
                      GUI.Timeline.Render.Constants,
@@ -91,6 +93,7 @@ Executable threadscope-pmw
   ghc-options:  -Wall -fwarn-tabs
                 -fno-warn-type-defaults -fno-warn-name-shadowing
                 -fno-warn-unused-do-bind
+                -rtsopts
                 -- Note: we do not want to use -threaded with gtk2hs.
 
   if impl(ghc < 6.12)

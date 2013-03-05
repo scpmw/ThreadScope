@@ -160,8 +160,6 @@ drawActivity hecs start end slice ts hints color = do
        dashedLine1
      restore
 
- where
-
 -- | Draw a dashed line along the current path.
 dashedLine1 :: Render ()
 dashedLine1 = do

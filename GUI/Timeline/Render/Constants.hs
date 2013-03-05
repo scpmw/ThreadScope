@@ -3,7 +3,8 @@ module GUI.Timeline.Render.Constants (
     hecTraceHeight, hecInstantHeight, hecSparksHeight,
     hecBarOff, hecBarHeight, hecLabelExtra,
     activityGraphHeight, stdHistogramHeight, histXScaleHeight,
-    ticksHeight, ticksPad
+    ticksHeight, ticksPad,
+    taskBarHeight, taskBarSpace,
   ) where
 
 -------------------------------------------------------------------------------
@@ -61,3 +62,9 @@ ticksHeight = 20
 
 ticksPad :: Int
 ticksPad = 20
+
+-- Tasks
+
+taskBarHeight, taskBarSpace :: Int
+taskBarHeight = 20
+taskBarSpace = 5

@@ -38,6 +38,7 @@ import Graphics.UI.Gtk
 import Graphics.Rendering.Cairo
 
 import Data.IORef
+import Data.IntMap as IM (empty)
 import Control.Monad
 
 -----------------------------------------------------------------------------
@@ -75,7 +76,7 @@ timelineSetLabelsMode timelineWin labelsMode = do
   widgetQueueDraw (timelineDrawingArea (timelineState timelineWin))
 
 timelineGetViewParameters :: TimelineView -> IO ViewParameters
-timelineGetViewParameters TimelineView{tracesIORef, bwmodeIORef, labelsModeIORef,
+timelineGetViewParameters TimelineView{tracesIORef, bwmodeIORef, labelsModeIORef, hecsIORef,
                                        timelineState=TimelineState{..}} = do
 
   (w, _) <- widgetGetSize timelineDrawingArea
@@ -91,9 +92,11 @@ timelineGetViewParameters TimelineView{tracesIORef, bwmodeIORef, labelsModeIORef
   labelsMode <- readIORef labelsModeIORef
 
   (_, xScaleAreaHeight) <- widgetGetSize timelineXScaleArea
+  m_hecs <- readIORef hecsIORef
   let histTotalHeight = stdHistogramHeight + histXScaleHeight
+      taskLay = maybe IM.empty taskLayout m_hecs
       timelineHeight =
-        calculateTotalTimelineHeight labelsMode histTotalHeight traces
+        calculateTotalTimelineHeight labelsMode histTotalHeight taskLay traces
 
   return ViewParameters
            { width      = w
@@ -187,7 +190,7 @@ timelineViewNew builder actions@TimelineViewActions{..} = do
         labelsMode <- readIORef labelsModeIORef
         let maxP = maxSparkPool hecs
             maxH = fromIntegral (maxYHistogram hecs)
-        updateYScaleArea timelineState maxP maxH Nothing labelsMode traces
+        updateYScaleArea timelineState maxP maxH Nothing labelsMode (taskLayout hecs) traces
         return True
 
   ------------------------------------------------------------------------
@@ -355,11 +358,13 @@ configureTimelineDrawingArea timelineWin@TimelineView{timelineState} = do
   updateTimelineHPageSize timelineState
 
 updateTimelineVScroll :: TimelineView -> IO ()
-updateTimelineVScroll TimelineView{tracesIORef, labelsModeIORef, timelineState=TimelineState{..}} = do
+updateTimelineVScroll TimelineView{tracesIORef, labelsModeIORef, hecsIORef, timelineState=TimelineState{..}} = do
   traces <- readIORef tracesIORef
   labelsMode <- readIORef labelsModeIORef
+  m_hecs <- readIORef hecsIORef
   let histTotalHeight = stdHistogramHeight + histXScaleHeight
-      h = calculateTotalTimelineHeight labelsMode histTotalHeight traces
+      taskLay = maybe IM.empty taskLayout m_hecs
+      h = calculateTotalTimelineHeight labelsMode histTotalHeight taskLay traces
   (_,winh) <- widgetGetSize timelineDrawingArea
   let winh' = fromIntegral winh;
       h' = fromIntegral h

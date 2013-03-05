@@ -7,6 +7,7 @@ import Events.SparkTree
 import Events.HECs (HECs(..), histogram)
 import Events.TestEvents
 import Events.EventDuration
+import Events.Tasks
 import qualified GUI.ProgressView as ProgressView
 import GUI.ProgressView (ProgressView)
 
@@ -194,6 +195,9 @@ buildEventLog progress from =
       -- round up to multiples of 10ms
       maxYHistogram = 10000 * ceiling (fromIntegral maxY / 10000)
 
+      !taskGraph = extractTaskGraph event_arr
+      taskLayout = snd $ layoutTaskGraph taskGraph
+
       hecs = HECs {
                hecCount         = hec_count,
                hecTrees         = trees,
@@ -203,7 +207,9 @@ buildEventLog progress from =
                minXHistogram    = minXHistogram,
                maxXHistogram    = maxXHistogram,
                maxYHistogram    = maxYHistogram,
-               durHistogram     = durHistogram
+               durHistogram     = durHistogram,
+               taskGraph        = taskGraph,
+               taskLayout       = taskLayout
             }
 
       treeProgress :: Int -> (DurationTree, EventTree, SparkTree) -> IO ()

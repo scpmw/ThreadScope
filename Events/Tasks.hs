@@ -6,12 +6,12 @@ module Events.Tasks (
   TaskLayout, layoutTaskGraph, taskLayoutHeight
   ) where
 
-import Control.DeepSeq
+import Control.Arrow (first)
 
 import qualified Data.IntSet as IS
 import qualified Data.IntMap as IM
 import Data.Ord (comparing)
-import Data.List (maximumBy, find, nub)
+import Data.List (minimumBy, maximumBy, find, nub)
 import Data.Maybe (mapMaybe, fromMaybe)
 import Data.Array
 
@@ -42,11 +42,12 @@ nodeLength n = taskEnd n - taskStart n + 1
 
 -- External types
 type TaskGraph = IM.IntMap TaskNode
-type TaskLayout = IM.IntMap Int
+type TaskLayout = IM.IntMap (Int, Either Int Int) -- (position, height)
 
 type TaskId = Int
 type NodeId = Int
 
+-- | State used in tree extraction
 data ExState =
   ExState { exNextNode :: !NodeId
             -- | currently active task on cap, with start time
@@ -66,8 +67,12 @@ extractTaskGraph = trace (show $ layoutTaskGraph testTaskGraph) $ cleanTaskGraph
 
 -- | Reads the raw task graph from event log array.
 makeTaskGraph :: Array Int CapEvent -> TaskGraph
--- TODO: We make a critical assumption here -- that a task which a
--- dependency is declared on is not currently running.
+-- TODO: We assume here that a dependency is "instant" -- that the
+-- target task at the current point needs the source task to be at the
+-- current point in order to proceed. On the other hand, there are
+-- many plausible situations where a task may depend just on another
+-- task being in a state that was reached at a point in the past -
+-- we'd have to extend our interface to capture this though.
 makeTaskGraph eventsArr =
  let makeNode cap taskId start end isSplit ExState{..} =
        let nodeId = exNextNode
@@ -200,7 +205,7 @@ cleanTaskGraph thresh graph0 =
                 !newGraph = IM.insert i newNd graph
                 !newNdMap = IM.insert i i ndMap
             in (newGraph, newNdMap)
-  in trace (show graph2) $ graph2
+  in graph2
 
 -- | Calculates a layout for the given task graph.
 layoutTaskGraph :: TaskGraph -> (Int, TaskLayout)
@@ -285,8 +290,6 @@ layoutTaskGraph dag =
                                , IM.singleton blkEnd (blockAt blkEnd)
                                , blocksRight ]
 
-      lengthSum = IS.foldr (\i x -> x + nodeLength (dag IM.! i)) 0
-
       roots = IM.keys $ IM.filter ((==[]) . taskParents) dag
       leaves = IM.keys $ IM.filter ((== []) . taskChilds) dag
   in go (combos roots leaves Nothing) (IM.singleton minBound 0) IM.empty
@@ -296,21 +299,24 @@ layoutTaskGraph dag =
       ancs = ancestors dag
 
       rcombos rs ls restrict =
-        [ (lengthSum path, r, taskChilds (dag IM.! r), ls, path)
+        [ (lengthSum dag path, r, taskChilds (dag IM.! r), ls, path)
         | r <- rs, let path = (descs IM.! r) `IS.intersection` restrict, not (IS.null path)]
       lcombos rs ls restrict =
-        [ (lengthSum path, l, rs, taskParents (dag IM.! l), path)
+        [ (lengthSum dag path, l, rs, taskParents (dag IM.! l), path)
         | l <- ls, let path = (ancs IM.! l) `IS.intersection` restrict, not (IS.null path)]
 
       updateCombos done = mapMaybe up
         where up (_, n, rs, ls, path) =
                 let path' = path `IS.difference` done
                 in if IS.null path' then Nothing else
-                     Just (lengthSum path', n, rs, ls, path')
+                     Just (lengthSum dag path', n, rs, ls, path')
 
       -- Catch as many simple cases as possible top-level to avoid
       -- having to actually compare paths (or leave them in memory).
       goTop rs ls start end lay path ind
+        | --trace (ind ++ "layouting path " ++ show path) $
+                          False = undefined
+        | IS.null path          = (0, start, end, lay)
         | null rs               = (0, start, end, lay)
         | null ls               = (0, start, end, lay)
         | [r] <- rs             = goSingleR r
@@ -321,42 +327,48 @@ layoutTaskGraph dag =
         where rcs = rcombos rs ls path
               lcs = lcombos rs ls path
               initBlocks = IM.singleton minBound IS.empty
-              goSingle rs ls n = goTop rs ls start end (IM.insert n 0 lay) path ind
-              goSingleR r = goSingle (taskChilds $ dag IM.! r) ls r
-              goSingleL l = goSingle rs (taskParents $ dag IM.! l) l
+              goSingle rs ls n s = (hgt, start', end', IM.insert n (0, s hgt) lay')
+                where (hgt, start', end', lay') =
+                        goTop rs ls (start `min` taskStart (dag IM.! n))
+                            (end `max` taskEnd (dag IM.! n))
+                            lay (IS.delete n path)
+                            ind
+              goSingleR r = goSingle (taskChilds $ dag IM.! r) ls r Right
+              goSingleL l = goSingle rs (taskParents $ dag IM.! l) l Left
 
       -- TODO: special-case having only one combination
       go [] _  _  _       !hgt !lay !start !end ind
-        = trace (ind ++ "= hgt: " ++ show hgt) $
-          (hgt, start, end, lay `deepseq` lay)
+        = trace (ind ++ "-- hgt: " ++ show hgt) $
+          (hgt, start, end, lay)
       go cs rs ls !blocks !hgt !lay !start !end ind
-        = trace (ind ++ "before: " ++ show blocks) $
+        = --trace (ind ++ "before: " ++ show blocks) $
+          trace (ind ++ "returned lay: " ++ show blkLay) $
           trace (ind ++ "range = " ++ show extStart ++ "-" ++ show extEnd ++ " y = " ++ show y) $
-          trace (ind ++ "blockers: " ++ show blockers ++ " hgt: " ++ show ownHgt) $
-          trace (ind ++ "after: " ++ show blocks') $
-          trace (ind ++ "hgt':" ++ show hgt') $
-          go cs' rs ls blocks' hgt' (lay' `deepseq` lay') start' end' ind
+          --trace (ind ++ "blockers: " ++ show blockers ++ " hgt: " ++ show ownHgt) $
+          --trace (ind ++ "after: " ++ show blocks') $
+          --trace (ind ++ "hgt':" ++ show hgt') $
+          trace (ind ++ "done: " ++ show bestPath)
+          go cs' rs ls blocks' hgt' lay' start' end' ind
         where
-          len (l,_,_,_,_) = l
-          (_, best, newRs, newLs, bestPath) = maximumBy (comparing len) cs
+          len (_,b,_,_,_) = taskStart (dag IM.! b)
+          (_, best, newRs, newLs, bestPath) = minimumBy (comparing len) cs
           !bestNd = dag IM.! best
+          !nodeDone = best `IM.member` lay
 
           -- get layout for recursed nodes
           (blkHgt, blkStart, blkEnd, blkLay)
-              = {-trace ("combs=" ++ show cs) $
+              = trace (ind ++ "layouting node " ++ show best) $
+                {-trace ("combs=" ++ show cs) $
                 trace ("b= " ++ show best ++ " " ++ show (IS.toList bestPath)) $ -}
                 goTop newRs newLs
-                      maxBound minBound
-                      IM.empty bestPath (' ':ind)
+                      (if nodeDone then maxBound else taskStart bestNd)
+                      (if nodeDone then minBound else taskEnd bestNd)
+                      IM.empty (IS.delete best bestPath) (' ':ind)
           cs' = updateCombos bestPath cs
-          start' | nodeDone  = start `min` blkStart
-                 | otherwise = start `min` blkStart `min` taskStart bestNd
-          end'   | nodeDone  = end `max` blkEnd
-                 | otherwise = end `max` blkEnd `max` taskEnd bestNd
 
           -- Extended bounds: Add some space
-          extStart = fromIntegral $ blkStart - (blkEnd - blkStart) `div` 8
-          extEnd = fromIntegral $ blkEnd + (blkEnd - blkStart) `div` 8
+          extStart = fromIntegral $ blkStart - ((blkEnd - blkStart) `div` 8)
+          extEnd = fromIntegral $ blkEnd + ((blkEnd - blkStart) `div` 8)
 
           -- Split up blockers
           !(!blocksRest, !blocksRight) = splitLT (extEnd+1) blocks
@@ -367,7 +379,6 @@ layoutTaskGraph dag =
           -- happens if it was part of a path of a node from the
           -- "other side", which however didn't pick up all our
           -- ancestors/descendants at the same time.
-          !nodeDone = best `IM.member` lay
           ownHgt | nodeDone  = blkHgt
                  | otherwise = 1 `max` blkHgt
 
@@ -378,11 +389,15 @@ layoutTaskGraph dag =
           !y = case filter (checkSpace . (+1)) (IS.toList blockers) of
             []    -> 0
             (y:_) -> y+1
-          lay1 = lay `IM.union` (IM.map (+y) blkLay)
+          lay1 = lay `IM.union` (IM.map (first (+y)) blkLay)
 
           -- New layout and height, retaining existing layout for our node.
-          lay' = IM.insertWith (flip const) best y lay1
+          !ndLay | best `elem` ls = (y, Left blkHgt)
+                 | otherwise      = (y, Right blkHgt)
+          lay' = IM.insertWith (flip const) best ndLay lay1
           hgt' = hgt `max` (y + ownHgt)
+          start' = start `min` blkStart
+          end' = end `max` blkEnd
 
           -- New blockers: Take over all blockers from the left,
           -- insert new blockers, duplicate blocker affecting right
@@ -393,8 +408,6 @@ layoutTaskGraph dag =
             IM.union (IM.map (IS.union newBlocks) blocksMid) $!
             (IM.insertWith (flip const) (extEnd+1) (snd $ IM.findMax blocksRest)) $!
             blocksRight
-
-      lengthSum = IS.foldr (\i x -> x + nodeLength (dag IM.! i)) 0
 
       roots = IM.keys $ IM.filter (null . taskParents) dag
       leaves = IM.keys $ IM.filter (null . taskChilds) dag
@@ -423,8 +436,12 @@ ancestors dag = ancs
         getAncs i nd = IS.singleton i `IS.union`
                        IS.unions (map (ancs IM.!) (taskParents nd))
 
+lengthSum :: TaskGraph -> IS.IntSet -> Int
+lengthSum dag = IS.foldr' (\i x -> x + (fromIntegral $ nodeLength $ dag IM.! i)) 0
+
+
 taskLayoutHeight :: TaskLayout -> Int
-taskLayoutHeight = (+1) . maximum . (0:) . IM.elems
+taskLayoutHeight = (+1) . maximum . (0:) . map fst . IM.elems
 
 testTaskGraph :: TaskGraph
 testTaskGraph = IM.fromList

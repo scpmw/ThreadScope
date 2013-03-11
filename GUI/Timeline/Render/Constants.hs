@@ -66,5 +66,5 @@ ticksPad = 20
 -- Tasks
 
 taskBarHeight, taskBarSpace :: Int
-taskBarHeight = 20
-taskBarSpace = 5
+taskBarHeight = 5
+taskBarSpace = 1

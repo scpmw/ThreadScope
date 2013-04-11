@@ -3,7 +3,8 @@
 
 module Events.Tasks (
   TaskNode(..), TaskGraph, extractTaskGraph,
-  TaskLayout, layoutTaskGraph, taskLayoutHeight
+  TaskLayout, layoutTaskGraph, taskLayoutHeight,
+  TaskTree(..), arrangeTaskTree
   ) where
 
 import Control.Arrow (first)
@@ -63,7 +64,9 @@ data ExState =
           }
 
 extractTaskGraph :: Array Int CapEvent -> TaskGraph
-extractTaskGraph = trace (show $ layoutTaskGraph testTaskGraph) $ cleanTaskGraph 100 . makeTaskGraph
+extractTaskGraph evs = let cleaned = cleanTaskGraph 100 graph
+                           graph = makeTaskGraph evs
+                       in trace (show $ arrangeTaskTree (lengthSum cleaned) cleaned) cleaned
 
 -- | Reads the raw task graph from event log array.
 makeTaskGraph :: Array Int CapEvent -> TaskGraph
@@ -136,7 +139,7 @@ makeTaskGraph eventsArr =
                in go (i+1) state3
              _other -> go (i+1) state
      (result, finalChilds) = go startIx $ ExState 0 IM.empty IM.empty IM.empty IM.empty IM.empty
-  in trace (show result) $ result
+  in result
 
 -- | Attempts to eliminate nodes that are smaller than the given
 -- threshold.
@@ -188,7 +191,7 @@ cleanTaskGraph thresh graph0 =
           Just prev   <- IM.lookup prevId graph,
             taskTid prev == taskTid nd,
           -- new start doesn't violate consistency
-          newEnd      <- taskEnd prev + taskLen,
+          newEnd      <- taskEnd prev + taskLen ,
           newChilds   <- nub (taskChilds nd ++
                               filter (/=i) (taskChilds prev)),
             all ((>= newEnd) . taskStart) (map (graph0 IM.!) newChilds)
@@ -423,6 +426,135 @@ splitLT k m = case IM.splitLookup k m of
   (lm, Nothing, rm) -> (lm, rm)
   (lm, Just x, rm)  -> (lm, IM.insert k x rm)
 
+-- | Tree arrangment of the task graph.
+--
+-- The idea is that each tree node consists of some graph node and
+-- number of sub-trees mad up of graph nodes connected with the graph
+-- node in question (either on the "left" or on the "right").
+data Shadowed = Shadowed | Visible deriving (Show)
+data TaskTree = TaskLeaf {-# UNPACK #-}!NodeId
+              | TaskNodeL !Shadowed {-# UNPACK #-}!NodeId [TaskTree]
+              | TaskNodeR !Shadowed {-# UNPACK #-}!NodeId [TaskTree]
+              deriving (Show)
+
+-- | Arranges the given graph into a task tree, prioritizing between
+-- different options using the given function.
+arrangeTaskTree :: (IS.IntSet -> Int) -> TaskGraph -> [TaskTree]
+arrangeTaskTree priority dag =
+  let descs = descendants dag
+      ancs = ancestors dag
+
+      mkTaskTree _     _    n [] = TaskLeaf n
+      mkTaskTree True  shad n ts = TaskNodeL shad n ts
+      mkTaskTree False shad n ts = TaskNodeR shad n ts
+
+      rcombos rs ls restrict =
+        [ (priority path, True, r, taskChilds (dag IM.! r), ls, path)
+        | r <- rs, let path = (descs IM.! r) `IS.intersection` restrict, not (IS.null path)]
+      lcombos rs ls restrict =
+        [ (priority path, False, l, rs, taskParents (dag IM.! l), path)
+        | l <- ls, let path = (ancs IM.! l) `IS.intersection` restrict, not (IS.null path)]
+
+      updateCombos done = mapMaybe $ \(_, s, n, rs, ls, path) ->
+        let path' = path `IS.difference` done
+        in if IS.null path' then Nothing else
+             Just (priority path', s, n, rs, ls, path')
+
+      -- Catch as many simple cases as possible top-level to avoid
+      -- having to actually compare paths (or leave them in memory).
+      goTop !rs !ls !path
+        | IS.null path            = []
+        | null rs                 = []
+        | null ls                 = []
+        | [r] <- rs               = [goSingleR r]
+        | [l] <- ls               = [goSingleL l]
+        | [(_,_,r,_,_,_)] <- rcs  = [goSingleR r]
+        | [(_,_,l,_,_,_)] <- lcs  = [goSingleL l]
+        | otherwise             = go (rcs++lcs) rs ls
+        where rcs = rcombos rs ls path
+              lcs = lcombos rs ls path
+              goSingleR r = mkTaskTree True (isShadowed r path) r $
+                            goTop (taskChilds $ dag IM.! r) ls (IS.delete r path)
+              goSingleL l = mkTaskTree False (isShadowed l path) l $
+                            goTop rs (taskParents $ dag IM.! l) (IS.delete l path)
+
+      isShadowed n path
+        | n `IS.member` path  = Visible
+        | otherwise           = Shadowed
+
+      go [] _  _  = []
+      go cs rs ls = mkTaskTree bestSide (isShadowed best bestPath) best subTrees
+                    : go cs' rs ls
+        where
+          len (l,_,_,_,_,_) = l
+          (_, bestSide, best, newRs, newLs, bestPath) = maximumBy (comparing len) cs
+
+          -- get recursed trees
+          subTrees = goTop newRs newLs (IS.delete best bestPath)
+          cs' = updateCombos bestPath cs
+
+      roots = IM.keys $ IM.filter (null . taskParents) dag
+      leaves = IM.keys $ IM.filter (null . taskChilds) dag
+
+  in goTop roots leaves (IM.keysSet dag)
+
+-- | Gives left bound for a task tree, corresponding to the left-most
+-- visible node.
+taskTreeLeft :: TaskGraph -> TaskTree -> Timestamp
+taskTreeLeft dag tree = case tree of
+  TaskLeaf n              -> taskStart $ dag IM.! n
+  TaskNodeL Visible  n _  -> taskStart $ dag IM.! n
+  TaskNodeL Shadowed _ ts -> minimum $ map (taskTreeLeft dag) ts
+  TaskNodeR _        _ ts -> minimum $ map (taskTreeLeft dag) ts
+
+-- | Gives right bound for a task tree, corresponding to the left-most
+-- visible node.
+taskTreeRight :: TaskGraph -> TaskTree -> Timestamp
+taskTreeRight dag tree = case tree of
+  TaskLeaf n              -> taskEnd $ dag IM.! n
+  TaskNodeR Visible  n _  -> taskEnd $ dag IM.! n
+  TaskNodeR Shadowed _ ts -> maximum $ map (taskTreeRight dag) ts
+  TaskNodeL _        _ ts -> maximum $ map (taskTreeRight dag) ts
+
+-- | A block tree, mapping timepoints to what lines are blocked.
+type BlockTree = IM.IntMap IS.IntSet
+
+-- | A block tree sliced into three parts
+type SlicedBlockTree = (BlockTree, BlockTree, BlockTree)
+
+emptyBlockTree :: BlockTree
+emptyBlockTree = IM.singleton minBound IS.empty
+
+sliceBlockTree :: (Int, Int) -> BlockTree -> SlicedBlockTree
+sliceBlockTree (x0, x1) blocks =
+  let !(!blocksRest, !blocksRight) = splitLT (x1+1) blocks
+      !(!blocksLeft, !blocksMid)   = splitLT x0 blocksRest
+
+      !(_, !startBlocks) = IM.findMax blocksLeft
+      !(_, !endBlocks)   = IM.findMax blocksRest
+
+      insertIgnore       = IM.insertWith (flip const)
+      !blocksMid'        = insertIgnore x0 startBlocks blocksMid
+      !blocksRight'      = insertIgnore (x1+1) endBlocks blocksRight
+  in (blocksLeft, blocksMid', blocksRight')
+
+unsliceBlockTree :: SlicedBlockTree -> BlockTree
+unsliceBlockTree (blocksLeft, blocksMid, blocksRight)
+  = IM.union blocksLeft $! IM.union blocksMid blocksRight
+
+findBlockPosition :: SlicedBlockTree -> Int -> Int
+findBlockPosition (_, blocksMid, _) hgt =
+  case filter (checkSpace . (+1)) (IS.toList blockers) of
+    []    -> 0
+    (y:_) -> y+1
+ where blockers = IS.unions (IM.elems blocksMid)
+       checkSpace y = IS.null $ snd $ IS.split (y-1) $ fst $ IS.split (y+hgt) blockers
+
+insertBlock :: (Int, Int) -> SlicedBlockTree -> SlicedBlockTree
+insertBlock (y0, y1) (blocksLeft, blocksMid, blocksRight)
+  = (blocksLeft, blocksMid', blocksRight)
+ where blocksMid' = IM.map (IS.union newBlocks) blocksMid
+       newBlocks = IS.fromList [y0..y1]
 
 descendants :: TaskGraph -> IM.IntMap IS.IntSet
 descendants dag = descs
@@ -477,5 +609,20 @@ embarassingTaskGraph = IM.fromList
   , (11, taskNode 11 12 [1] [13])
   , (12, taskNode 5 13 [1] [13])
   , (13, taskNode 13 14 [2,3,4,5,6,7,8,9,10,11,12] [])
+  ]
+  where taskNode = TaskNode 1 1
+
+hierarchicalTaskGraph :: TaskGraph
+hierarchicalTaskGraph = IM.fromList
+  [ (1, taskNode 1 2 [] [2,3])
+  , (2, taskNode 2 3 [1] [4,5])
+  , (3, taskNode 2 3 [1] [6,7])
+  , (4, taskNode 4 5 [2] [8])
+  , (5, taskNode 4 5 [2] [8])
+  , (6, taskNode 4 5 [3] [9])
+  , (7, taskNode 4 5 [3] [9])
+  , (8, taskNode 5 6 [4,5] [10])
+  , (9, taskNode 5 6 [6,7] [10])
+  , (10, taskNode 6 7 [8,9] [])
   ]
   where taskNode = TaskNode 1 1

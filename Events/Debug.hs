@@ -126,6 +126,8 @@ buildDebugMaps eventsArr progress = do
   -- Build range map
   let rangeMap = buildRangeMap dbgMap
   putStrLn  $ printf "Range map has %d entries" (IM.size rangeMap)
+  --flip mapM_ (IM.assocs rangeMap) $ \(x, dbg) ->
+  --  printf "%016x: %s\n" x (bsToStr (dbgLabel dbg))
 
   -- Build core map
   let coreMap = buildCoreMap dbgMap
@@ -302,19 +304,30 @@ lookupRanges maps ips =
   let -- Check whether the first IP has a match in the range map
       go []      _  res = res
       go is0@((_,ip):is) rm res = case IM.splitLookup ip rm of
-        (_,     Just d,  rm')         -> found 0 is0 d rm' res
+        (_,     Just d,  rm')         -> found 0 is0 d rm' (get_bound rm' d) res
         (lower, Nothing, rm')
           | IM.null lower             -> not_found ip is rm' res
-          | (_,d) <- IM.findMax lower -> found 0 is0 d rm' res
+          | (_,d) <- IM.findMax lower -> found 0 is0 d rm' (get_bound rm' d) res
           | otherwise                 -> not_found ip is rm' res
+
       -- Found a (possibly) matching debug entry, count number of IPs
       -- that actually match, then continue with reduced IPs and range
       -- map as well as another entry in the hits list..
-      found n ((w,ip):is) d rm res
-        | any (ip `inIPRange`) (dbgRanges d)
-          = found (n+w) is d rm res
-      found n ips d rm (hs,ms)
-          = go ips rm (if n > 0 then (n,Just d):hs else hs, ms)
+      found n ((w,ip):is) d rm bound res
+        | ip < bound && any (ip `inIPRange`) (dbgRanges d)
+          = found (n+w) is d rm bound res
+      found n ips d rm _ (hs,ms)
+          = go ips rm $! (if n > 0 then (n,Just d):hs else hs, ms)
+
+      -- Find where we need to stop matching IPs - either because the
+      -- next (sub-)block starts or because our IP range ends.
+      get_bound rm d
+        | IM.null rm
+        = maximum $ map rangeEnd $ dbgRanges d
+        | (next,_) <- IM.findMin rm
+        = let ranges' = filter ((< next) . rangeStart) $ dbgRanges d
+          in maximum $ map (min next . rangeEnd) ranges'
+
       not_found ip is rm (hs, ms)
         = trace (printf "Could not place IP %08x" ip) $
           go is rm (hs, ms+1)

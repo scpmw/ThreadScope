@@ -357,12 +357,17 @@ lookupCore DebugMaps{coreMap=coreMap} unit bind cons
 
 findAllocationEntry :: DebugMaps -> DebugEntry -> DebugEntry
 findAllocationEntry maps dbg =
-  case fmap (findAllocation . dbgCoreCode) (dbgDCore dbg) of
-    Just (Binds bs)
-      | [child] <- filter (not . checkNoAlloc maps) (mapMaybe findBind bs)
-           -> findAllocationEntry maps child
-    _other -> dbg
- where findBind (b, c) = Map.lookup (dbgUnit dbg, b, c) (coreMap maps)
+  case dbgDCore dbg of
+    Nothing
+      | Just p <- dbgParent dbg
+      -> findAllocationEntry maps p
+    Just core
+      | Binds bs <- findAllocation (dbgCoreCode core),
+        [child] <- filter (not . checkNoAlloc maps) (mapMaybe findBind bs)
+      -> findAllocationEntry maps child
+    _otherwise
+      -> dbg
+  where findBind (b, c) = Map.lookup (dbgUnit dbg, b, c) (coreMap maps)
 
 checkNoAlloc :: DebugMaps -> DebugEntry -> Bool
 checkNoAlloc maps dbg =
